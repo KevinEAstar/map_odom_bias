@@ -1,0 +1,329 @@
+/**
+ * @file bias_estimator.cpp
+ * @brief BiasEstimator 实现: 状态机 / 门控 / 慢吸收 / reset 补偿
+ */
+
+#include "map_odom_bias/core/bias_estimator.hpp"
+
+#include <algorithm>
+#include <cmath>
+
+namespace map_odom_bias
+{
+
+namespace pm = pose_math;
+
+BiasEstimator::BiasEstimator(const BiasEstimatorParams & params)
+: params_(params)
+{
+}
+
+bool BiasEstimator::within(const pm::Transform4D & a, const pm::Transform4D & b,
+                           double trans_th, double yaw_th)
+{
+    const double dx = a.x - b.x;
+    const double dy = a.y - b.y;
+    const double dz = a.z - b.z;
+    const double dt = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const double dyaw = std::fabs(pm::wrap_angle(a.yaw - b.yaw));
+    return dt <= trans_th && dyaw <= yaw_th;
+}
+
+pm::Transform4D BiasEstimator::median_of(const std::deque<pm::Transform4D> & w)
+{
+    // 每通道独立中值 (偶数窗口取中间两值平均); yaw 以首元素为基准的
+    // 相对角中值, 防 ±180° 环绕 (窗口内观测经门控约束, 相对角远离环绕点)
+    auto channel_median = [](std::vector<double> & v) {
+        std::sort(v.begin(), v.end());
+        const std::size_t n = v.size();
+        return (n % 2 == 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+    };
+    std::vector<double> xs, ys, zs, yaws;
+    const double base_yaw = w.front().yaw;
+    for (const auto & t : w) {
+        xs.push_back(t.x);
+        ys.push_back(t.y);
+        zs.push_back(t.z);
+        yaws.push_back(pm::wrap_angle(t.yaw - base_yaw));
+    }
+    pm::Transform4D m;
+    m.x = channel_median(xs);
+    m.y = channel_median(ys);
+    m.z = channel_median(zs);
+    m.yaw = pm::wrap_angle(base_yaw + channel_median(yaws));
+    return m;
+}
+
+pm::Transform4D BiasEstimator::mean_of(const std::vector<pm::Transform4D> & c)
+{
+    // yaw 以首帧为基准的相对角均值, 防 ±180° 环绕
+    // (候选帧相互一致 (< 门限之半), 相对角远离环绕点)
+    pm::Transform4D m;
+    const double base_yaw = c.front().yaw;
+    double sum_yaw_rel = 0.0;
+    for (const auto & t : c) {
+        m.x += t.x;
+        m.y += t.y;
+        m.z += t.z;
+        sum_yaw_rel += pm::wrap_angle(t.yaw - base_yaw);
+    }
+    const double n = static_cast<double>(c.size());
+    m.x /= n;
+    m.y /= n;
+    m.z /= n;
+    m.yaw = pm::wrap_angle(base_yaw + sum_yaw_rel / n);
+    return m;
+}
+
+void BiasEstimator::add_observation(const pm::Transform4D & obs, double t)
+{
+    // 有限性守卫: NaN/inf 观测一旦进账本, 门控比较对 NaN 恒 false 且
+    // 速率 clamp 失效, raw/ctrl 无法恢复 —— 在唯一入口拦截
+    if (!(std::isfinite(obs.x) && std::isfinite(obs.y) &&
+          std::isfinite(obs.z) && std::isfinite(obs.yaw) &&
+          std::isfinite(t))) {
+        ++invalid_obs_count_;
+        return;
+    }
+
+    switch (state_) {
+        case BiasState::UNINITIALIZED:
+            init_candidates_.clear();
+            init_candidates_.push_back(obs);
+            last_obs_time_ = t;
+            state_ = BiasState::INITIALIZING;
+            return;
+
+        case BiasState::INITIALIZING:
+            // 初始化一致性确认 (详设 4.7) —— 帧间一致标准与门控候选队列
+            // 同口径 (门限之半), 防止用一帧误检完成初始化。
+            // 候选可能被 reset 清空 (apply_reset), 此时 obs 成为新起点。
+            last_obs_time_ = t;    // 初始化候选均视为有效观测
+            if (!init_candidates_.empty() &&
+                within(obs, init_candidates_.back(),
+                       params_.gate_trans_threshold * 0.5,
+                       params_.gate_yaw_threshold * 0.5)) {
+                init_candidates_.push_back(obs);
+                if (static_cast<int>(init_candidates_.size()) >=
+                    params_.init_confirm_frames) {
+                    // 初始化不走吸收: ctrl/cmd 无先验, raw = ctrl = cmd = 候选均值
+                    raw_ = mean_of(init_candidates_);
+                    ctrl_ = raw_;
+                    cmd_ = raw_;
+                    init_candidates_.clear();
+                    reseed_raw_window();
+                    state_ = BiasState::TRACKING;
+                }
+            } else {
+                init_candidates_.clear();
+                init_candidates_.push_back(obs);    // 新帧成为新候选起点
+            }
+            return;
+
+        case BiasState::TRACKING:
+        case BiasState::STALE:
+            gate_and_update(obs, t);
+            return;
+    }
+}
+
+void BiasEstimator::gate_and_update(const pm::Transform4D & obs, double t)
+{
+    // 正常路径 (详设 4.4 第 1 条): 观测与 raw 的偏差在门限内 → 账本采纳。
+    // last_obs_time 只在观测被账本采纳时刷新 —— 被拒绝的观测不算"有效",
+    // 误检风暴下账本停更, obs_age 增长直至 STALE 告警 (详设 v2.1, F02)
+    if (within(obs, raw_, params_.gate_trans_threshold,
+               params_.gate_yaw_threshold)) {
+        // 被正常路径清空的候选 = 被抛弃的观测, 按帧数计入拒绝 (F13)
+        gate_reject_count_ += static_cast<uint32_t>(gate_candidates_.size());
+        gate_candidates_.clear();
+        accept_raw(obs);
+        last_obs_time_ = t;
+        if (state_ == BiasState::STALE) {
+            state_ = BiasState::TRACKING;    // 观测被采纳 → 断流恢复
+        }
+        return;
+    }
+
+    // 候选路径 (第 2/3 条)
+    if (!gate_candidates_.empty() &&
+        within(obs, gate_candidates_.back(),
+               params_.gate_trans_threshold * 0.5,
+               params_.gate_yaw_threshold * 0.5)) {
+        // 与队列内候选一致 → 累积
+        gate_candidates_.push_back(obs);
+        if (static_cast<int>(gate_candidates_.size()) >=
+            params_.gate_confirm_frames) {
+            // 确认为真实跳变: raw ← 候选均值, 一次性跳变不渐变。
+            // 确认的候选帧最终被采纳, 不计入拒绝 —— 合法重定位事件
+            // 不污染误检信号 (F13)
+            const pm::Transform4D old_raw = raw_;
+            raw_ = mean_of(gate_candidates_);
+            gate_candidates_.clear();
+            reseed_raw_window();
+            record_jump(old_raw, raw_);
+            last_obs_time_ = t;
+            if (state_ == BiasState::STALE) {
+                state_ = BiasState::TRACKING;    // 候选确认 → 断流恢复
+            }
+        }
+    } else {
+        // 队列空 (首个突变帧), 或与候选不一致 → 被重置的旧候选计入拒绝,
+        // 队列重置为仅含新帧
+        gate_reject_count_ += static_cast<uint32_t>(gate_candidates_.size());
+        gate_candidates_.clear();
+        gate_candidates_.push_back(obs);
+    }
+}
+
+void BiasEstimator::accept_raw(const pm::Transform4D & obs)
+{
+    if (params_.raw_median_window <= 1) {
+        raw_ = obs;    // 默认: 不滤, 保持"监控要真"
+        return;
+    }
+    raw_window_.push_back(obs);
+    while (static_cast<int>(raw_window_.size()) > params_.raw_median_window) {
+        raw_window_.pop_front();
+    }
+    raw_ = median_of(raw_window_);
+}
+
+void BiasEstimator::reseed_raw_window()
+{
+    // raw 基准跳变 (初始化/跳变确认/reset 补偿) 后, 窗口内历史观测已
+    // 不代表新基准 → 以新 raw 为种子重建
+    raw_window_.clear();
+    if (params_.raw_median_window > 1) {
+        raw_window_.push_back(raw_);
+    }
+}
+
+void BiasEstimator::record_jump(const pm::Transform4D & old_raw,
+                                const pm::Transform4D & new_raw)
+{
+    const double dx = new_raw.x - old_raw.x;
+    const double dy = new_raw.y - old_raw.y;
+    const double dz = new_raw.z - old_raw.z;
+    last_jump_trans_ = std::sqrt(dx * dx + dy * dy + dz * dz);
+    last_jump_yaw_ = std::fabs(pm::wrap_angle(new_raw.yaw - old_raw.yaw));
+    ++jump_count_;
+}
+
+void BiasEstimator::absorb_toward(const pm::Transform4D & target,
+                                  pm::Transform4D & state, double dt,
+                                  double tau, double rate_trans, double rate_yaw)
+{
+    // 吸收律 (详设 4.5, ctrl/cmd 共用): 一阶低通 + 速率硬上限
+    const double alpha = dt / tau;
+    double step_x = (target.x - state.x) * alpha;
+    double step_y = (target.y - state.y) * alpha;
+    double step_z = (target.z - state.z) * alpha;
+    double step_yaw = pm::wrap_angle(target.yaw - state.yaw) * alpha;
+
+    // 平移按向量范数限幅 (保方向缩模长, 详设伪代码的按通道取值落地口径)
+    const double norm = std::sqrt(step_x * step_x + step_y * step_y +
+                                  step_z * step_z);
+    const double trans_limit = rate_trans * dt;
+    if (norm > trans_limit && norm > 0.0) {
+        const double scale = trans_limit / norm;
+        step_x *= scale;
+        step_y *= scale;
+        step_z *= scale;
+    }
+    const double yaw_limit = rate_yaw * dt;
+    step_yaw = std::max(-yaw_limit, std::min(yaw_limit, step_yaw));
+
+    state.x += step_x;
+    state.y += step_y;
+    state.z += step_z;
+    state.yaw = pm::wrap_angle(state.yaw + step_yaw);
+}
+
+void BiasEstimator::tick(double t_now)
+{
+    // dt 防御: 首拍只记基准; 时钟回退刷新基准; 单拍上限 max_tick_dt
+    // (定时器挂起恢复时防 ctrl/cmd 单步大跳)
+    double dt = 0.0;
+    if (last_tick_time_ >= 0.0 && t_now > last_tick_time_) {
+        dt = std::min(t_now - last_tick_time_, params_.max_tick_dt);
+    }
+    last_tick_time_ = t_now;
+
+    // STALE 判定先于步进: 进入 STALE 当拍即冻结
+    if (state_ == BiasState::TRACKING && has_observation() &&
+        t_now - last_obs_time_ > params_.observation_timeout) {
+        state_ = BiasState::STALE;
+    }
+    if (state_ != BiasState::TRACKING || dt <= 0.0) {
+        return;    // STALE 双通道冻结 / 未初始化无状态 / 无时间推进
+    }
+
+    // ctrl 慢通道 (感知侧, 稳) 与 cmd 快通道 (指令侧, 贴 raw) 同律不同参
+    absorb_toward(raw_, ctrl_, dt, params_.absorb_time_constant,
+                  params_.max_correction_rate_trans,
+                  params_.max_correction_rate_yaw);
+    absorb_toward(raw_, cmd_, dt, params_.cmd_absorb_time_constant,
+                  params_.cmd_max_correction_rate_trans,
+                  params_.cmd_max_correction_rate_yaw);
+}
+
+void BiasEstimator::apply_reset(const pm::Transform4D & d)
+{
+    // UNINITIALIZED 无内部状态可补偿, 也不记事件 —— 详设 4.6: 该状态
+    // "仅更新 counter 缓存" (缓存在节点薄壳完成, F15)
+    if (state_ == BiasState::UNINITIALIZED) {
+        return;
+    }
+
+    ++reset_event_count_;
+    last_reset_trans_ = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+    last_reset_yaw_ = std::fabs(pm::wrap_angle(d.yaw));
+
+    if (state_ == BiasState::INITIALIZING) {
+        // 初始化候选是旧坐标系下的观测, 清空重新累积 (详设 4.6:
+        // 简单且安全, 初始化耗时仅数帧); 状态保持 INITIALIZING
+        init_candidates_.clear();
+        return;
+    }
+
+    // TRACKING / STALE:
+    // raw/ctrl/cmd ← ·D⁻¹: 机体 map 系位姿跨 reset 连续
+    //   T_map_base = (raw·D⁻¹)·(D·T_odom_base) = raw·T_odom_base
+    // STALE 也执行 —— 账本的坐标系基准必须跟随 reset, 否则断流恢复
+    // 时 raw 与首帧观测相差整个 delta (详设 4.6 与状态机的交互)
+    const pm::Transform4D d_inv = pm::inverse(d);
+    raw_ = pm::compose(raw_, d_inv);
+    ctrl_ = pm::compose(ctrl_, d_inv);
+    cmd_ = pm::compose(cmd_, d_inv);
+    gate_candidates_.clear();    // 旧坐标系下的候选作废
+    reseed_raw_window();         // 中值窗口内历史观测同属旧坐标系
+}
+
+double BiasEstimator::divergence_trans() const
+{
+    const double dx = raw_.x - ctrl_.x;
+    const double dy = raw_.y - ctrl_.y;
+    const double dz = raw_.z - ctrl_.z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+double BiasEstimator::divergence_yaw() const
+{
+    return std::fabs(pm::wrap_angle(raw_.yaw - ctrl_.yaw));
+}
+
+double BiasEstimator::divergence_cmd_trans() const
+{
+    const double dx = cmd_.x - ctrl_.x;
+    const double dy = cmd_.y - ctrl_.y;
+    const double dz = cmd_.z - ctrl_.z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+double BiasEstimator::divergence_cmd_yaw() const
+{
+    return std::fabs(pm::wrap_angle(cmd_.yaw - ctrl_.yaw));
+}
+
+}  // namespace map_odom_bias

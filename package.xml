@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>map_odom_bias</name>
+  <version>0.1.0</version>
+  <description>map→odom 偏置层: raw/ctrl/cmd 三状态 + 门控 + 双轨慢吸收 + EKF reset 补偿的通用定位修正中间层 (核心库零 ROS 依赖)</description>
+  <maintainer email="2671964674@qq.com">Entropix-rore</maintainer>
+  <license>TODO: License declaration</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- v1 核心库阶段零运行时依赖; ROS 壳迁入时再追加 rclcpp/geometry_msgs 等 -->
+
+  <!-- 仅测试时需要 -->
+  <test_depend>ament_cmake_gtest</test_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
