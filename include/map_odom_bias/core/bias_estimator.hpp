@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "map_odom_bias/core/pose_math.hpp"
+#include "map_odom_bias/core/time_types.hpp"
 
 namespace map_odom_bias
 {
@@ -76,8 +77,11 @@ public:
 
     /**
      * @brief 喂入一帧 4DoF 偏差观测 (pose_math::bias_observation 的输出)
-     * @param obs  观测到的 T_map_odom (4DoF)
-     * @param t    观测时刻 (图像戳), 本地 ROS 钟, 秒
+     * @param obs       观测到的 T_map_odom (4DoF)
+     * @param t_sample  观测采样刻 (图像曝光戳, 采样钟域) —— 进账本/门控
+     * @param t_arrival 本帧到达/处理刻 (节点钟) —— 判存活 (STALE 超时以
+     *                  到达刻计, ⑤钟域纪律"进估计用采样戳、判存活用到达
+     *                  刻": 深延迟链路的健康观测流不再被误判断流)
      * @param p_ob 本帧机体在 odom 系的位置 (bias_observation 的 odom_base
      *             位置) —— 门控在该点做机体点残差度量 (③修法, 设计文档 v1
      *             四节): yaw 解算噪声经力臂 |p_ob| 的平移伪差在此度量下
@@ -92,12 +96,13 @@ public:
      *                   TRACKING (详设 4.7: 恢复走门控, 长断流后的漂移偏差
      *                   按候选路径数帧确认, 正好是期望行为)
      */
-    void add_observation(const pose_math::Transform4D & obs, double t,
+    void add_observation(const pose_math::Transform4D & obs,
+                         SampleTime t_sample, HostTime t_arrival,
                          const std::array<double, 3> & p_ob = {{0.0, 0.0, 0.0}});
 
     /**
      * @brief 定时步进 (tf_publish_rate 驱动): STALE 判定 + ctrl/cmd 双通道吸收
-     * @param t_now 当前时刻, 要求单调不减
+     * @param t_now 当前到达/处理刻 (节点钟), 要求单调不减
      * @param eval_points 机体评估点集 (通常 = OdomBuffer 最新样本位置);
      *        钳位预算在此点集度量 —— 物理语义为"机体 setpoint 被拉动的
      *        速率 ≤ rate_trans" (③修法, yaw 步进经力臂的拉动计入同一预算)。
@@ -111,7 +116,7 @@ public:
      * cmd 用 cmd_absorb_time_constant / cmd_max_correction_rate_* (快通道)。
      * 仅 TRACKING 状态步进; STALE 双通道冻结 (断流时变换保持最后估计)。
      */
-    void tick(double t_now,
+    void tick(HostTime t_now,
               const std::vector<std::array<double, 3>> & eval_points =
                   std::vector<std::array<double, 3>>());
 
@@ -148,11 +153,16 @@ public:
             std::vector<std::array<double, 3>>()) const;
     /// cmd 与 ctrl 的 yaw 差 (最短角, 绝对值)
     double divergence_cmd_yaw() const;
-    /// 最后一帧被账本采纳的观测时刻 (obs_age = now − last_obs_time);
-    /// 被门控拒绝的观测不刷新 —— 误检风暴下账本停更, obs_age 增长直至
-    /// STALE 告警 (详设 3.3/4.8 "有效观测" 口径, 对抗复核 F02)
-    double last_obs_time() const { return last_obs_time_; }
-    bool has_observation() const { return last_obs_time_ >= 0.0; }
+    /// 最后被账本采纳观测的采样刻 (账本时间语义); 被门控拒绝的观测
+    /// 不刷新 —— 误检风暴下账本停更, obs_age 增长直至 STALE 告警
+    /// (详设 3.3/4.8 "有效观测" 口径, 对抗复核 F02)
+    SampleTime last_obs_sample_time() const { return last_obs_sample_; }
+    /// 最后被采纳观测的到达刻 (STALE 超时与 obs_age 的判定钟)
+    HostTime last_obs_arrival() const { return last_obs_arrival_; }
+    /// 最后被采纳观测的端到端延迟 (到达 − 采样, 同源钟假设;
+    /// status.obs_delay 数据源 —— EV_DELAY 类旋钮不再离线反推)
+    double last_obs_delay() const { return last_obs_delay_; }
+    bool has_observation() const { return has_observation_; }
     /// 门控拒绝累计: 候选队列被抛弃时按帧数计入 (被正常路径清空 / 与新帧
     /// 不一致被重置); 最终确认为真实跳变的候选帧不计 —— 合法重定位事件
     /// 不污染误检信号 (对抗复核 F13)
@@ -163,6 +173,10 @@ public:
     uint32_t jump_count() const { return jump_count_; }
     double last_jump_trans() const { return last_jump_trans_; }
     double last_jump_yaw() const { return last_jump_yaw_; }
+    /// 参考系事件单调计数 (④ResetEvent 的 iteration 数据源): 跳变确认
+    /// (SOURCE_JUMP) 与 reset 补偿 (EKF_RESET) 均自增; 下游与出口数据
+    /// 同拍比对上一拍即检测, 幂等且丢帧可补
+    uint32_t reference_iteration() const { return reference_iteration_; }
     /// EKF reset 补偿事件
     uint32_t reset_event_count() const { return reset_event_count_; }
     double last_reset_trans() const { return last_reset_trans_; }
@@ -182,8 +196,11 @@ private:
     static pose_math::Transform4D median_of(
         const std::deque<pose_math::Transform4D> & w);
 
-    void gate_and_update(const pose_math::Transform4D & obs, double t,
+    void gate_and_update(const pose_math::Transform4D & obs,
+                         SampleTime t_sample, HostTime t_arrival,
                          const std::array<double, 3> & p_ob);
+    /// 观测被账本采纳时的时序记账 (采样刻 + 到达刻 + 延迟)
+    void note_observation(SampleTime t_sample, HostTime t_arrival);
     /// 正常路径采纳: raw_median_window > 1 时经中值窗口去毛刺
     void accept_raw(const pose_math::Transform4D & obs);
     /// raw 基准跳变 (跳变确认/初始化/reset 补偿) 后重置中值窗口
@@ -209,14 +226,19 @@ private:
     std::vector<pose_math::Transform4D> gate_candidates_;
     std::deque<pose_math::Transform4D> raw_window_;    // 中值去毛刺窗口
 
-    double last_obs_time_{-1.0};
-    double last_tick_time_{-1.0};
+    SampleTime last_obs_sample_;
+    HostTime last_obs_arrival_;
+    double last_obs_delay_{0.0};
+    bool has_observation_{false};
+    HostTime last_tick_;
+    bool has_ticked_{false};
 
     uint32_t gate_reject_count_{0};
     uint32_t invalid_obs_count_{0};
     uint32_t jump_count_{0};
     double last_jump_trans_{0.0};
     double last_jump_yaw_{0.0};
+    uint32_t reference_iteration_{0};
     uint32_t reset_event_count_{0};
     double last_reset_trans_{0.0};
     double last_reset_yaw_{0.0};

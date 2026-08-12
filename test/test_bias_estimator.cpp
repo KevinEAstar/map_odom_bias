@@ -20,6 +20,8 @@
 using map_odom_bias::BiasEstimator;
 using map_odom_bias::BiasEstimatorParams;
 using map_odom_bias::BiasState;
+using map_odom_bias::HostTime;
+using map_odom_bias::SampleTime;
 namespace pm = map_odom_bias::pose_math;
 
 namespace
@@ -71,7 +73,7 @@ protected:
     {
         for (int i = 0; i < n; ++i) {
             t_ += kObsDt;
-            e.add_observation(obs, t_);
+            e.add_observation(obs, SampleTime{t_}, HostTime{t_});
         }
     }
 
@@ -86,7 +88,7 @@ protected:
     {
         for (int i = 0; i < n; ++i) {
             t_ += kTickDt;
-            e.tick(t_);
+            e.tick(HostTime{t_});
         }
     }
 
@@ -644,7 +646,7 @@ TEST_F(BiasEstimatorTest, F19_MaxTickDtLimitsSingleStep)
     init_to(e, t4(0, 0, 0, 0));
     feed(e, t4(1.0, 0.0, 0.0, 0.0), 3);    // raw 跳到 1 m
     run_ticks(e, 1);                        // 建基准
-    e.tick(t_ + 10.0);                      // 10 s 空窗后单拍
+    e.tick(HostTime{t_ + 10.0});                      // 10 s 空窗后单拍
     // dt 被截到 max_tick_dt=0.2: step = 1·(0.2/5) = 0.04 m (不限则一步到位)
     EXPECT_LE(e.ctrl().x, 0.05);
     EXPECT_GT(e.ctrl().x, 0.01);
@@ -809,7 +811,7 @@ TEST_F(BiasEstimatorTest, GateAtBodyPointYawNoiseWithLeverArmNotRejected)
     const std::array<double, 3> p_ob = {{4.0, 3.0, 0.5}};    // r_horiz = 5
     for (int i = 0; i < params_.init_confirm_frames; ++i) {
         t_ += kObsDt;
-        e.add_observation(t_true, t_, p_ob);
+        e.add_observation(t_true, SampleTime{t_}, HostTime{t_}, p_ob);
     }
     ASSERT_EQ(e.state(), BiasState::TRACKING);
 
@@ -825,7 +827,7 @@ TEST_F(BiasEstimatorTest, GateAtBodyPointYawNoiseWithLeverArmNotRejected)
               params_.gate_trans_threshold);
 
     t_ += kObsDt;
-    e.add_observation(obs, t_, p_ob);
+    e.add_observation(obs, SampleTime{t_}, HostTime{t_}, p_ob);
     EXPECT_EQ(e.gate_reject_count(), 0u);
     EXPECT_NEAR(e.raw().x, obs.x, 1e-12);    // 正常路径原值采纳
     EXPECT_NEAR(e.raw().yaw, obs.yaw, 1e-12);
@@ -838,11 +840,11 @@ TEST_F(BiasEstimatorTest, GateAtBodyPointTrueTranslationStillRejected)
     const std::array<double, 3> p_ob = {{4.0, 3.0, 0.5}};
     for (int i = 0; i < params_.init_confirm_frames; ++i) {
         t_ += kObsDt;
-        e.add_observation(t4(0.0, 0.0, 0.0, 0.0), t_, p_ob);
+        e.add_observation(t4(0.0, 0.0, 0.0, 0.0), SampleTime{t_}, HostTime{t_}, p_ob);
     }
     ASSERT_EQ(e.state(), BiasState::TRACKING);
     t_ += kObsDt;
-    e.add_observation(t4(0.5, 0.0, 0.0, 0.0), t_, p_ob);
+    e.add_observation(t4(0.5, 0.0, 0.0, 0.0), SampleTime{t_}, HostTime{t_}, p_ob);
     EXPECT_NEAR(e.raw().x, 0.0, 1e-12);    // 未入账本 (走候选队列)
 }
 
@@ -862,13 +864,58 @@ TEST_F(BiasEstimatorTest, AbsorbClampBudgetAtBodyPoint)
     for (int i = 0; i < 50; ++i) {
         const pm::Transform4D before = e.ctrl();
         t_ += kTickDt;
-        e.tick(t_, eval);
+        e.tick(HostTime{t_}, eval);
         const pm::TransformError moved =
             pm::transform_error(e.ctrl(), before, eval);
         EXPECT_LE(moved.trans,
                   params_.max_correction_rate_trans * kTickDt + 1e-9);
     }
     EXPECT_GT(e.ctrl().yaw, 0.0);    // 预算内仍在收敛, 非死锁
+}
+
+// ---- ⑤钟域: STALE 以到达刻判定 / 双钟记账 / iteration 计数 ----
+
+TEST_F(BiasEstimatorTest, StaleJudgedByArrivalNotSampleStamp)
+{
+    // 深延迟链路 (采样戳滞后到达刻 2.5s > timeout 2.0s), 观测流本身健康:
+    // 旧混域判定 (tick 到达刻 − 采样戳) 会把常驻延迟误判为断流;
+    // ⑤修正后 STALE 只看到达刻年龄 → 保持 TRACKING
+    params_.observation_timeout = 2.0;
+    BiasEstimator e(params_);
+    const double delay = 2.5;
+    for (int i = 0; i < 3; ++i) {
+        t_ += kObsDt;
+        e.add_observation(t4(0, 0, 0, 0), SampleTime{t_ - delay}, HostTime{t_});
+    }
+    ASSERT_EQ(e.state(), BiasState::TRACKING);
+    EXPECT_NEAR(e.last_obs_delay(), delay, 1e-12);    // 延迟常驻可观测
+    // 观测持续到达 (到达间隔 << timeout), 其间 tick 不应判 STALE
+    for (int i = 0; i < 60; ++i) {
+        t_ += kObsDt;
+        e.add_observation(t4(0, 0, 0, 0), SampleTime{t_ - delay}, HostTime{t_});
+        t_ += kTickDt;
+        e.tick(HostTime{t_});
+        ASSERT_EQ(e.state(), BiasState::TRACKING) << "i=" << i;
+    }
+    // 真断流 (到达停止) 仍要判 STALE: 语义未被放松
+    t_ += 2.1;
+    e.tick(HostTime{t_});
+    EXPECT_EQ(e.state(), BiasState::STALE);
+}
+
+TEST_F(BiasEstimatorTest, ReferenceIterationCountsJumpAndReset)
+{
+    // 参考系事件单调计数 (④ResetEvent 的 iteration 数据源):
+    // 初始化不计, 跳变确认 +1, reset 补偿 +1
+    BiasEstimator e(params_);
+    init_to(e, t4(0, 0, 0, 0));
+    EXPECT_EQ(e.reference_iteration(), 0u);
+    feed(e, t4(1.0, 0.0, 0.0, 0.0), 3);       // 候选 3 帧确认跳变
+    ASSERT_EQ(e.jump_count(), 1u);
+    EXPECT_EQ(e.reference_iteration(), 1u);
+    e.apply_reset(t4(0.2, 0.0, 0.0, 0.0));    // EKF reset 补偿
+    ASSERT_EQ(e.reset_event_count(), 1u);
+    EXPECT_EQ(e.reference_iteration(), 2u);
 }
 
 TEST_F(BiasEstimatorTest, DivergenceAtBodyPoint)

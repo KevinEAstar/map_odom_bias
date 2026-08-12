@@ -33,8 +33,10 @@
 #include <tf2_ros/transform_broadcaster.h>
 
 #include <map_odom_bias/msg/bias_status.hpp>
+#include <map_odom_bias/msg/reset_event.hpp>
 
 #include "map_odom_bias/core/bias_estimator.hpp"
+#include "map_odom_bias/core/obs_intake.hpp"
 #include "map_odom_bias/core/odom_buffer.hpp"
 #include "map_odom_bias/ros/px4_reset_source.hpp"
 
@@ -62,6 +64,9 @@ private:
     void publish_control_transforms(const rclcpp::Time & stamp);
     void publish_raw(const rclcpp::Time & stamp);
     void publish_status(const rclcpp::Time & stamp);
+    /// 参考系事件发布 (D1 独立 topic; iteration 取估计器权威计数)
+    void publish_reset_event(uint8_t cause, const pose_math::Transform4D & delta,
+                             const rclcpp::Time & stamp);
     /// 状态机跳变检测: 日志分级打印 + status 立即发布
     void handle_state_change(BiasState prev_state);
 
@@ -82,6 +87,7 @@ private:
     std::unique_ptr<OdomBuffer> odom_buffer_;
     std::unique_ptr<BiasEstimator> estimator_;
     std::unique_ptr<Px4ResetSource> reset_source_;
+    ObsIntake intake_;    // 修正源两票链 (v1 = FiniteGuard)
 
     uint32_t eval_fallback_count_{0};    // tick 时缓冲空的退化计数 (健康信号)
 
@@ -93,6 +99,7 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr raw_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_map_raw_pub_;
     rclcpp::Publisher<map_odom_bias::msg::BiasStatus>::SharedPtr status_pub_;
+    rclcpp::Publisher<map_odom_bias::msg::ResetEvent>::SharedPtr reset_event_pub_;
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr tick_timer_;
     rclcpp::TimerBase::SharedPtr status_timer_;

@@ -16,8 +16,11 @@ float64 raw_ctrl_divergence_trans  # raw 与 ctrl 在机体点的位置分歧 m;
 float64 raw_ctrl_divergence_yaw    # raw 与 ctrl 的 yaw 差 rad (最短角)
 float64 cmd_ctrl_divergence_trans  # cmd 与 ctrl 在机体点的位置分歧 m = 出口快通道当前修正量 (作用量监控)
 float64 cmd_ctrl_divergence_yaw    # cmd 与 ctrl 的 yaw 差 rad (最短角)
-float64 obs_age                    # 最后有效观测距今 s (断流预警, 早于 STALE 触发); 未收到过观测 = -1
+float64 obs_age                    # 最后有效观测距今 s, 以到达刻计 (断流预警, 早于 STALE 触发); 未收到过观测 = -1
+float64 obs_delay                  # 最后有效观测端到端延迟 s (到达刻 − 采样刻; 延迟常驻可观测, EV_DELAY 类旋钮不再离线反推)
+uint32 iteration                   # 参考系事件单调计数 (与 ~/reset_event 同源双载)
 uint32 gate_reject_count           # 门控拒绝累计; 增长速率异常 = 误检率上升/双解翻转频发
+uint32 intake_dropped              # 修正源链废弃帧累计 (FiniteGuard 等生死票)
 uint32 obs_too_old                 # 时间戳对齐丢弃计数 (早于缓冲/缓冲空)
 uint32 obs_too_new                 # 时间戳对齐丢弃计数 (超外推上限); 链路延迟/时钟异常线索
 uint32 eval_fallback_count         # tick 时 odom 缓冲为空的累计 (钳位/divergence 退化为参数空间度量)

@@ -23,6 +23,9 @@ namespace map_odom_bias
 
 namespace pm = pose_math;
 
+using map_odom_bias::HostTime;
+using map_odom_bias::SampleTime;
+
 namespace
 {
 
@@ -145,6 +148,8 @@ MapOdomBiasNode::MapOdomBiasNode()
 
     odom_buffer_.reset(new OdomBuffer(odom_buffer_duration, max_extrapolation));
     estimator_.reset(new BiasEstimator(bp));
+    // 修正源两票链 (五节 5.2, C1: 接口 v1 就位): v1 首发 = FiniteGuard
+    intake_.add(std::unique_ptr<ObsProcessor>(new FiniteGuard));
 
     // [✅] Step 2: 订阅
     // map 系机体位姿观测 (定位节点输出, header.stamp = 图像曝光时刻)
@@ -178,6 +183,9 @@ MapOdomBiasNode::MapOdomBiasNode()
         "~/pose_map_raw", rclcpp::SensorDataQoS());
     status_pub_ = this->create_publisher<map_odom_bias::msg::BiasStatus>(
         "~/status", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+    // 参考系事件 (D1 独立 topic): 事件流不可丢, reliable + 深度 10
+    reset_event_pub_ = this->create_publisher<map_odom_bias::msg::ResetEvent>(
+        "~/reset_event", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
     tf_broadcaster_.reset(new tf2_ros::TransformBroadcaster(*this));
 
     // create_timer (非 wall): 跟随节点时钟, use_sim_time 下随 /clock 步进,
@@ -220,7 +228,8 @@ void MapOdomBiasNode::pose_callback(
 
     // ① 按图像戳在 odom 缓冲中插值 → T_odom_base(t) (拒绝时缓冲内已计数)
     pm::Pose odom_base;
-    const OdomBuffer::QueryResult r = odom_buffer_->query(t_img, &odom_base);
+    const OdomBuffer::QueryResult r =
+        odom_buffer_->query(SampleTime{t_img}, &odom_base);
     if (r != OdomBuffer::QueryResult::OK) {
         RCLCPP_DEBUG(this->get_logger(),
             "[BIAS] 观测时间对齐失败 (%s), t_img=%.3f buffer=[%.3f, %.3f]",
@@ -229,18 +238,32 @@ void MapOdomBiasNode::pose_callback(
         return;
     }
 
-    // ② 4DoF 偏差观测 → ③ 门控与 raw 更新 (纯逻辑层)。门控评估点 =
-    // 本帧配对的机体 odom 位置 (③修法: yaw 解算噪声力臂贡献恒零)
-    const pm::Transform4D obs =
-        pm::bias_observation(pose_from_msg(msg->pose.pose), odom_base);
+    // ② 4DoF 偏差观测 → 修正源两票链 → ③ 门控与 raw 更新 (纯逻辑层)。
+    // 门控评估点 = 本帧配对的机体 odom 位置 (③修法: yaw 噪声力臂贡献恒零);
+    // 采样刻 = 图像曝光戳 (进账本/门控), 到达刻 = 节点钟 (判存活)
+    GlobalPoseObservation gobs;
+    gobs.t_sample = SampleTime{t_img};
+    gobs.t_arrival = HostTime{this->now().seconds()};
+    gobs.T_obs = pm::bias_observation(pose_from_msg(msg->pose.pose), odom_base);
+    gobs.p_ob = odom_base.p;
+    if (!intake_.run(gobs, *estimator_)) {
+        return;    // 生死票废弃 (计数进 status.intake_dropped)
+    }
     const BiasState prev = estimator_->state();
     const uint32_t jumps_before = estimator_->jump_count();
-    estimator_->add_observation(obs, t_img, odom_base.p);
+    const pm::Transform4D raw_before = estimator_->raw();
+    estimator_->add_observation(gobs.T_obs, gobs.t_sample, gobs.t_arrival,
+                                gobs.p_ob);
     handle_state_change(prev);
     if (estimator_->jump_count() != jumps_before) {
         RCLCPP_WARN(this->get_logger(),
             "⚡ [BIAS-JUMP] 确认跳变: Δtrans=%.3fm Δyaw=%.3frad (重定位事件)",
             estimator_->last_jump_trans(), estimator_->last_jump_yaw());
+        // SOURCE_JUMP 事件: delta = map 系点重定基增量 T_new·T_old⁻¹
+        publish_reset_event(
+            map_odom_bias::msg::ResetEvent::CAUSE_SOURCE_JUMP,
+            pm::compose(estimator_->raw(), pm::inverse(raw_before)),
+            this->now());
         publish_status(this->now());
     }
 
@@ -253,7 +276,7 @@ void MapOdomBiasNode::pose_callback(
 void MapOdomBiasNode::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
 {
     OdomSample s;
-    s.t = rclcpp::Time(msg->header.stamp).seconds();
+    s.t = SampleTime{rclcpp::Time(msg->header.stamp).seconds()};
     s.pose = pose_from_msg(msg->pose.pose);
     // 被缓冲拒绝的样本 (非有限/乱序/reset 静默窗口内的旧坐标系尾巴) 同样
     // 不得用于 pose_map_raw —— 否则 reset 后会把新系 raw 与旧系 odom 拼出
@@ -288,12 +311,19 @@ void MapOdomBiasNode::handle_reset(const pm::Transform4D & d_total)
     const BiasState prev = estimator_->state();
     estimator_->apply_reset(d_total);
     // 附带动作: 缓冲清空 + 静默窗口 (旧坐标系样本 + DDS 乱序尾巴防护)
-    odom_buffer_->clear_and_settle(now.seconds() + reset_settle_duration_);
+    // 静默窗以样本戳判定 (同源钟假设在此显式声明, ⑤钟域)
+    odom_buffer_->clear_and_settle(as_sample_time_assuming_same_clock(
+        HostTime{now.seconds() + reset_settle_duration_}));
+
+    intake_.reset_all();    // 链上历史属旧坐标系, 一并清空
 
     RCLCPP_WARN(this->get_logger(),
         "⚡ [BIAS-RESET] reset 补偿施加: D=(%.3f, %.3f, %.3f, %.3frad), "
         "state=%s",
         d_total.x, d_total.y, d_total.z, d_total.yaw, state_name(prev));
+    // EKF_RESET 事件: delta = odom 系改写左乘增量 D (ENU)
+    publish_reset_event(map_odom_bias::msg::ResetEvent::CAUSE_EKF_RESET,
+                        d_total, now);
     // 补偿改写了 ctrl/cmd/raw, 立即重发 —— 否则下游在一个 tick 周期内
     // 持有旧坐标系的 map→odom 变换 (F09)
     if (initialized()) {
@@ -313,7 +343,7 @@ void MapOdomBiasNode::tick_timer_callback()
     if (pts.empty() && initialized()) {
         ++eval_fallback_count_;
     }
-    estimator_->tick(now.seconds(), pts);
+    estimator_->tick(HostTime{now.seconds()}, pts);
     handle_state_change(prev);
 
     // UNINITIALIZED/INITIALIZING 不发布 (map 系不可用);
@@ -339,6 +369,20 @@ void MapOdomBiasNode::publish_control_transforms(const rclcpp::Time & stamp)
     cmd_pub_->publish(transform_to_msg(estimator_->cmd(), stamp));
 }
 
+void MapOdomBiasNode::publish_reset_event(
+    uint8_t cause, const pm::Transform4D & delta, const rclcpp::Time & stamp)
+{
+    map_odom_bias::msg::ResetEvent msg;
+    msg.header.stamp = stamp;
+    msg.cause = cause;
+    msg.iteration = estimator_->reference_iteration();
+    msg.dx = delta.x;
+    msg.dy = delta.y;
+    msg.dz = delta.z;
+    msg.dyaw = delta.yaw;
+    reset_event_pub_->publish(msg);
+}
+
 void MapOdomBiasNode::publish_raw(const rclcpp::Time & stamp)
 {
     raw_pub_->publish(transform_to_msg(estimator_->raw(), stamp));
@@ -355,9 +399,14 @@ void MapOdomBiasNode::publish_status(const rclcpp::Time & stamp)
     msg.raw_ctrl_divergence_yaw = estimator_->divergence_yaw();
     msg.cmd_ctrl_divergence_trans = estimator_->divergence_cmd_trans(pts);
     msg.cmd_ctrl_divergence_yaw = estimator_->divergence_cmd_yaw();
+    // obs_age 以到达刻计 (⑤钟域: 判存活用到达刻, 与 STALE 同口径)
     msg.obs_age = estimator_->has_observation()
-        ? stamp.seconds() - estimator_->last_obs_time() : -1.0;
+        ? age_of(estimator_->last_obs_arrival(), HostTime{stamp.seconds()})
+        : -1.0;
+    msg.obs_delay = estimator_->last_obs_delay();
+    msg.iteration = estimator_->reference_iteration();
     msg.gate_reject_count = estimator_->gate_reject_count();
+    msg.intake_dropped = intake_.dropped_count();
     msg.obs_too_old = odom_buffer_->too_old_count();
     msg.obs_too_new = odom_buffer_->too_new_count();
     msg.eval_fallback_count = eval_fallback_count_;

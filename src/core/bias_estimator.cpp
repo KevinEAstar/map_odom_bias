@@ -76,14 +76,25 @@ pm::Transform4D BiasEstimator::mean_of(const std::vector<pm::Transform4D> & c)
     return m;
 }
 
-void BiasEstimator::add_observation(const pm::Transform4D & obs, double t,
+void BiasEstimator::note_observation(SampleTime t_sample, HostTime t_arrival)
+{
+    last_obs_sample_ = t_sample;
+    last_obs_arrival_ = t_arrival;
+    // 同源钟假设声明点: 采样戳由本机钟盖 (相机驱动/fc_bridge), 差值即
+    // 端到端延迟; 采样戳换设备独立钟时此处需重审 (⑤钟域)
+    last_obs_delay_ = delay_assuming_same_clock(t_sample, t_arrival);
+    has_observation_ = true;
+}
+
+void BiasEstimator::add_observation(const pm::Transform4D & obs,
+                                    SampleTime t_sample, HostTime t_arrival,
                                     const std::array<double, 3> & p_ob)
 {
     // 有限性守卫: NaN/inf 观测一旦进账本, 门控比较对 NaN 恒 false 且
     // 速率 clamp 失效, raw/ctrl 无法恢复 —— 在唯一入口拦截
     if (!(std::isfinite(obs.x) && std::isfinite(obs.y) &&
           std::isfinite(obs.z) && std::isfinite(obs.yaw) &&
-          std::isfinite(t) &&
+          std::isfinite(t_sample.s) && std::isfinite(t_arrival.s) &&
           std::isfinite(p_ob[0]) && std::isfinite(p_ob[1]) &&
           std::isfinite(p_ob[2]))) {
         ++invalid_obs_count_;
@@ -94,7 +105,7 @@ void BiasEstimator::add_observation(const pm::Transform4D & obs, double t,
         case BiasState::UNINITIALIZED:
             init_candidates_.clear();
             init_candidates_.push_back(obs);
-            last_obs_time_ = t;
+            note_observation(t_sample, t_arrival);
             state_ = BiasState::INITIALIZING;
             return;
 
@@ -102,7 +113,7 @@ void BiasEstimator::add_observation(const pm::Transform4D & obs, double t,
             // 初始化一致性确认 (详设 4.7) —— 帧间一致标准与门控候选队列
             // 同口径 (门限之半), 防止用一帧误检完成初始化。
             // 候选可能被 reset 清空 (apply_reset), 此时 obs 成为新起点。
-            last_obs_time_ = t;    // 初始化候选均视为有效观测
+            note_observation(t_sample, t_arrival);    // 初始化候选均视为有效观测
             if (!init_candidates_.empty() &&
                 within_at(obs, init_candidates_.back(), p_ob,
                           params_.gate_trans_threshold * 0.5,
@@ -126,12 +137,13 @@ void BiasEstimator::add_observation(const pm::Transform4D & obs, double t,
 
         case BiasState::TRACKING:
         case BiasState::STALE:
-            gate_and_update(obs, t, p_ob);
+            gate_and_update(obs, t_sample, t_arrival, p_ob);
             return;
     }
 }
 
-void BiasEstimator::gate_and_update(const pm::Transform4D & obs, double t,
+void BiasEstimator::gate_and_update(const pm::Transform4D & obs,
+                                    SampleTime t_sample, HostTime t_arrival,
                                     const std::array<double, 3> & p_ob)
 {
     // 正常路径 (详设 4.4 第 1 条): 观测与 raw 的偏差在门限内 → 账本采纳。
@@ -145,7 +157,7 @@ void BiasEstimator::gate_and_update(const pm::Transform4D & obs, double t,
         gate_reject_count_ += static_cast<uint32_t>(gate_candidates_.size());
         gate_candidates_.clear();
         accept_raw(obs);
-        last_obs_time_ = t;
+        note_observation(t_sample, t_arrival);
         if (state_ == BiasState::STALE) {
             state_ = BiasState::TRACKING;    // 观测被采纳 → 断流恢复
         }
@@ -169,7 +181,7 @@ void BiasEstimator::gate_and_update(const pm::Transform4D & obs, double t,
             gate_candidates_.clear();
             reseed_raw_window();
             record_jump(old_raw, raw_);
-            last_obs_time_ = t;
+            note_observation(t_sample, t_arrival);
             if (state_ == BiasState::STALE) {
                 state_ = BiasState::TRACKING;    // 候选确认 → 断流恢复
             }
@@ -215,6 +227,7 @@ void BiasEstimator::record_jump(const pm::Transform4D & old_raw,
     last_jump_trans_ = std::sqrt(dx * dx + dy * dy + dz * dz);
     last_jump_yaw_ = std::fabs(pm::wrap_angle(new_raw.yaw - old_raw.yaw));
     ++jump_count_;
+    ++reference_iteration_;    // 跳变确认 = 参考系事件 (SOURCE_JUMP)
 }
 
 void BiasEstimator::absorb_toward(const pm::Transform4D & target,
@@ -264,20 +277,23 @@ void BiasEstimator::absorb_toward(const pm::Transform4D & target,
     state.yaw = pm::wrap_angle(state.yaw + step_yaw);
 }
 
-void BiasEstimator::tick(double t_now,
+void BiasEstimator::tick(HostTime t_now,
                          const std::vector<std::array<double, 3>> & eval_points)
 {
     // dt 防御: 首拍只记基准; 时钟回退刷新基准; 单拍上限 max_tick_dt
     // (定时器挂起恢复时防 ctrl/cmd 单步大跳)
     double dt = 0.0;
-    if (last_tick_time_ >= 0.0 && t_now > last_tick_time_) {
-        dt = std::min(t_now - last_tick_time_, params_.max_tick_dt);
+    if (has_ticked_ && t_now.s > last_tick_.s) {
+        dt = std::min(t_now.s - last_tick_.s, params_.max_tick_dt);
     }
-    last_tick_time_ = t_now;
+    last_tick_ = t_now;
+    has_ticked_ = true;
 
-    // STALE 判定先于步进: 进入 STALE 当拍即冻结
+    // STALE 判定先于步进: 进入 STALE 当拍即冻结。超时以**到达刻**计
+    // (⑤钟域纪律): 深延迟链路下健康观测流不被误判断流, 断流判定
+    // 与链路延迟解耦
     if (state_ == BiasState::TRACKING && has_observation() &&
-        t_now - last_obs_time_ > params_.observation_timeout) {
+        age_of(last_obs_arrival_, t_now) > params_.observation_timeout) {
         state_ = BiasState::STALE;
     }
     if (state_ != BiasState::TRACKING || dt <= 0.0) {
@@ -302,6 +318,7 @@ void BiasEstimator::apply_reset(const pm::Transform4D & d)
     }
 
     ++reset_event_count_;
+    ++reference_iteration_;    // reset 补偿 = 参考系事件 (EKF_RESET)
     last_reset_trans_ = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
     last_reset_yaw_ = std::fabs(pm::wrap_angle(d.yaw));
 

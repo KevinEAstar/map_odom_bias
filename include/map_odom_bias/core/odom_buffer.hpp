@@ -23,6 +23,7 @@
 #include <deque>
 
 #include "map_odom_bias/core/pose_math.hpp"
+#include "map_odom_bias/core/time_types.hpp"
 
 namespace map_odom_bias
 {
@@ -30,7 +31,7 @@ namespace map_odom_bias
 /// odom 位姿样本 (ENU 世界系位置 + FLU 机体姿态)
 struct OdomSample
 {
-    double t{0.0};    // header.stamp, 本地 ROS 钟, 秒
+    SampleTime t;    // header.stamp (采样钟域, ⑤钟域声明)
     pose_math::Pose pose;
 };
 
@@ -61,22 +62,29 @@ public:
      * @brief 按时间戳查询位姿 (线性插值 + slerp)
      * @note 非 const: TOO_OLD/TOO_NEW/EMPTY 时内部健康计数自增
      */
-    QueryResult query(double t, pose_math::Pose * out);
+    QueryResult query(SampleTime t, pose_math::Pose * out);
 
     /**
      * @brief EKF reset: 清空缓冲并进入静默窗口 (详设 4.6)
-     * @param settle_until 窗口截止时刻; 在此之前的样本 push 时直接丢弃。
-     *        判定用样本戳 (= fc_bridge 到达时刻本地钟, 与本节点到达时刻
-     *        进程间差 µs 级, 等效且纯逻辑可测)
+     * @param settle_until 窗口截止时刻 (采样钟域); 在此之前的样本 push
+     *        时直接丢弃。调用方以 as_sample_time_assuming_same_clock 从
+     *        到达刻换算 —— 样本戳 = fc_bridge 到达时刻本地钟, 与本节点
+     *        到达时刻进程间差 µs 级, 同源假设在调用点显式声明
      */
-    void clear_and_settle(double settle_until);
+    void clear_and_settle(SampleTime settle_until);
 
     void clear();
 
     std::size_t size() const { return buf_.size(); }
     bool empty() const { return buf_.empty(); }
-    double oldest_time() const { return buf_.empty() ? 0.0 : buf_.front().t; }
-    double newest_time() const { return buf_.empty() ? 0.0 : buf_.back().t; }
+    SampleTime oldest_time() const
+    {
+        return buf_.empty() ? SampleTime{} : buf_.front().t;
+    }
+    SampleTime newest_time() const
+    {
+        return buf_.empty() ? SampleTime{} : buf_.back().t;
+    }
     /// 最新样本位姿 (③修法钳位/divergence 的机体评估点来源;
     /// 调用方须先以 empty() 确认非空)
     const pose_math::Pose & newest_pose() const { return buf_.back().pose; }
@@ -92,7 +100,7 @@ private:
     std::deque<OdomSample> buf_;    // 时间严格升序
     double duration_;
     double max_extrapolation_;
-    double settle_until_{0.0};
+    SampleTime settle_until_;
 
     uint32_t too_old_count_{0};
     uint32_t too_new_count_{0};

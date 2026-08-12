@@ -14,6 +14,7 @@
 
 using map_odom_bias::OdomBuffer;
 using map_odom_bias::OdomSample;
+using map_odom_bias::SampleTime;
 namespace pm = map_odom_bias::pose_math;
 
 namespace
@@ -23,7 +24,7 @@ namespace
 OdomSample sample_at(double t)
 {
     OdomSample s;
-    s.t = t;
+    s.t = SampleTime{t};
     const double w = 2.0 * pm::kPi;
     s.pose.p = {{std::sin(w * t), std::cos(w * t), 0.5 * std::sin(w * t)}};
     s.pose.q = pm::quat_from_yaw(0.5 * std::sin(w * t));
@@ -47,7 +48,7 @@ TEST(OdomBufferInterp, UT01_SineTrajectoryUnder1mm)
     // 非采样点密集查询 (0.0771 与 4 ms 采样周期互质, 覆盖各种插值相位)
     for (double t = 0.1003; t < 1.9; t += 0.0771) {
         pm::Pose out;
-        ASSERT_EQ(buf.query(t, &out), OdomBuffer::QueryResult::OK) << "t=" << t;
+        ASSERT_EQ(buf.query(SampleTime{t}, &out), OdomBuffer::QueryResult::OK) << "t=" << t;
         const OdomSample ref = sample_at(t);
         EXPECT_NEAR(out.p[0], ref.pose.p[0], 1e-3);
         EXPECT_NEAR(out.p[1], ref.pose.p[1], 1e-3);
@@ -64,9 +65,9 @@ TEST(OdomBufferBoundary, UT02_TooOldRejectedAndCounted)
     OdomBuffer buf(1.0, 0.05);    // 缓冲仅 1 s
     fill_sine(buf, 0.0, 2.0);     // 旧样本被时长剔除, 最旧 ≈ 1.0 s
     pm::Pose out;
-    EXPECT_EQ(buf.query(0.5, &out), OdomBuffer::QueryResult::TOO_OLD);
+    EXPECT_EQ(buf.query(SampleTime{0.5}, &out), OdomBuffer::QueryResult::TOO_OLD);
     EXPECT_EQ(buf.too_old_count(), 1u);
-    EXPECT_EQ(buf.query(0.2, &out), OdomBuffer::QueryResult::TOO_OLD);
+    EXPECT_EQ(buf.query(SampleTime{0.2}, &out), OdomBuffer::QueryResult::TOO_OLD);
     EXPECT_EQ(buf.too_old_count(), 2u);
 }
 
@@ -76,10 +77,10 @@ TEST(OdomBufferBoundary, UT02_TooNewBeyondExtrapolationRejected)
     fill_sine(buf, 0.0, 1.0);
     pm::Pose out;
     // 超外推上限 → TOO_NEW
-    EXPECT_EQ(buf.query(1.0 + 0.051, &out), OdomBuffer::QueryResult::TOO_NEW);
+    EXPECT_EQ(buf.query(SampleTime{1.0 + 0.051}, &out), OdomBuffer::QueryResult::TOO_NEW);
     EXPECT_EQ(buf.too_new_count(), 1u);
     // 外推上限之内 → 零阶保持返回最新样本
-    ASSERT_EQ(buf.query(1.0 + 0.049, &out), OdomBuffer::QueryResult::OK);
+    ASSERT_EQ(buf.query(SampleTime{1.0 + 0.049}, &out), OdomBuffer::QueryResult::OK);
     const OdomSample newest = sample_at(1.0);
     EXPECT_NEAR(out.p[0], newest.pose.p[0], 1e-9);
     EXPECT_NEAR(out.p[1], newest.pose.p[1], 1e-9);
@@ -94,7 +95,7 @@ TEST(OdomBufferReset, UT14_ClearAndSettleDropsStaleSamples)
     ASSERT_GT(buf.size(), 0u);
 
     // reset 于 t=1.0, 静默窗口至 1.05
-    buf.clear_and_settle(1.05);
+    buf.clear_and_settle(SampleTime{1.05});
     EXPECT_EQ(buf.size(), 0u);
 
     // 窗口内到达的旧坐标系样本 (乱序尾巴) 直接丢弃并计数
@@ -105,13 +106,13 @@ TEST(OdomBufferReset, UT14_ClearAndSettleDropsStaleSamples)
 
     // 窗口内查询: 缓冲为空 → EMPTY, 计入 too_old (详设 4.6 附带动作 3)
     pm::Pose out;
-    EXPECT_EQ(buf.query(1.02, &out), OdomBuffer::QueryResult::EMPTY);
+    EXPECT_EQ(buf.query(SampleTime{1.02}, &out), OdomBuffer::QueryResult::EMPTY);
     EXPECT_EQ(buf.too_old_count(), 1u);
 
     // 窗口后样本正常入缓冲, 跨 reset 无错误插值结果产出
     EXPECT_TRUE(buf.push(sample_at(1.06)));
     EXPECT_TRUE(buf.push(sample_at(1.064)));
-    ASSERT_EQ(buf.query(1.062, &out), OdomBuffer::QueryResult::OK);
+    ASSERT_EQ(buf.query(SampleTime{1.062}, &out), OdomBuffer::QueryResult::OK);
     const OdomSample ref = sample_at(1.062);
     EXPECT_NEAR(out.p[0], ref.pose.p[0], 1e-3);
 }
@@ -135,7 +136,7 @@ TEST(OdomBufferGuard, F04_NonFiniteSampleDropped)
     // 后续正常样本与插值不受影响
     ASSERT_TRUE(buf.push(sample_at(0.512)));
     pm::Pose out;
-    ASSERT_EQ(buf.query(0.506, &out), OdomBuffer::QueryResult::OK);
+    ASSERT_EQ(buf.query(SampleTime{0.506}, &out), OdomBuffer::QueryResult::OK);
     EXPECT_TRUE(std::isfinite(out.p[2]));
     const OdomSample ref = sample_at(0.506);
     EXPECT_NEAR(out.p[0], ref.pose.p[0], 1e-3);
@@ -157,7 +158,7 @@ TEST(OdomBufferGuard, OldSamplesPrunedByDuration)
 {
     OdomBuffer buf(1.0, 0.05);
     fill_sine(buf, 0.0, 3.0);
-    EXPECT_GE(buf.oldest_time(), buf.newest_time() - 1.0 - 1e-9);
+    EXPECT_GE(buf.oldest_time().s, buf.newest_time().s - 1.0 - 1e-9);
     // 250 Hz × 1 s ≈ 251 条
     EXPECT_LE(buf.size(), 260u);
 }
@@ -168,7 +169,7 @@ TEST(OdomBufferInterp, ExactSampleTimeHit)
     OdomBuffer buf(4.0, 0.05);
     fill_sine(buf, 0.0, 1.0);
     pm::Pose out;
-    ASSERT_EQ(buf.query(0.5, &out), OdomBuffer::QueryResult::OK);
+    ASSERT_EQ(buf.query(SampleTime{0.5}, &out), OdomBuffer::QueryResult::OK);
     const OdomSample ref = sample_at(0.5);
     EXPECT_NEAR(out.p[0], ref.pose.p[0], 1e-12);
     EXPECT_NEAR(out.p[1], ref.pose.p[1], 1e-12);
@@ -180,7 +181,7 @@ TEST(OdomBufferBoundary, EmptyBufferQueryCountsAsTooOld)
 {
     OdomBuffer buf(4.0, 0.05);
     pm::Pose out;
-    EXPECT_EQ(buf.query(1.0, &out), OdomBuffer::QueryResult::EMPTY);
+    EXPECT_EQ(buf.query(SampleTime{1.0}, &out), OdomBuffer::QueryResult::EMPTY);
     EXPECT_EQ(buf.too_old_count(), 1u);
 }
 
@@ -194,5 +195,5 @@ TEST(OdomBufferAccess, NewestPoseIsLastPushed)
     EXPECT_NEAR(buf.newest_pose().p[0], last.pose.p[0], 1e-12);
     EXPECT_NEAR(buf.newest_pose().p[1], last.pose.p[1], 1e-12);
     EXPECT_NEAR(buf.newest_pose().p[2], last.pose.p[2], 1e-12);
-    EXPECT_NEAR(buf.newest_time(), 0.5, 1e-12);
+    EXPECT_NEAR(buf.newest_time().s, 0.5, 1e-12);
 }

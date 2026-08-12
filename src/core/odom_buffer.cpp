@@ -16,7 +16,7 @@ namespace
 
 bool sample_is_finite(const OdomSample & s)
 {
-    return std::isfinite(s.t) &&
+    return std::isfinite(s.t.s) &&
            std::isfinite(s.pose.p[0]) && std::isfinite(s.pose.p[1]) &&
            std::isfinite(s.pose.p[2]) &&
            std::isfinite(s.pose.q.w) && std::isfinite(s.pose.q.x) &&
@@ -38,36 +38,36 @@ bool OdomBuffer::push(const OdomSample & sample)
         return false;
     }
     // reset 静默窗口: 旧坐标系的乱序尾巴直接丢弃 (详设 4.6 附带动作 3)
-    if (sample.t < settle_until_) {
+    if (sample.t.s < settle_until_.s) {
         ++settle_drop_count_;
         return false;
     }
     // 时间戳必须严格递增 (DDS best-effort 链路防御)
-    if (!buf_.empty() && sample.t <= buf_.back().t) {
+    if (!buf_.empty() && sample.t.s <= buf_.back().t.s) {
         ++disorder_drop_count_;
         return false;
     }
     buf_.push_back(sample);
     // 剔除超出缓冲时长的旧样本
-    const double cutoff = sample.t - duration_;
-    while (!buf_.empty() && buf_.front().t < cutoff) {
+    const double cutoff = sample.t.s - duration_;
+    while (!buf_.empty() && buf_.front().t.s < cutoff) {
         buf_.pop_front();
     }
     return true;
 }
 
-OdomBuffer::QueryResult OdomBuffer::query(double t, pose_math::Pose * out)
+OdomBuffer::QueryResult OdomBuffer::query(SampleTime t, pose_math::Pose * out)
 {
     if (buf_.empty()) {
         ++too_old_count_;    // EMPTY 健康计数并入 too_old (详设 4.6: 窗口内
         return QueryResult::EMPTY;    // 观测因缓冲为空自然丢弃, 计入 obs_too_old)
     }
-    if (t < buf_.front().t) {
+    if (t.s < buf_.front().t.s) {
         ++too_old_count_;
         return QueryResult::TOO_OLD;
     }
-    if (t > buf_.back().t) {
-        if (t - buf_.back().t <= max_extrapolation_) {
+    if (t.s > buf_.back().t.s) {
+        if (t.s - buf_.back().t.s <= max_extrapolation_) {
             *out = buf_.back().pose;    // 等效零阶保持
             return QueryResult::OK;
         }
@@ -76,15 +76,15 @@ OdomBuffer::QueryResult OdomBuffer::query(double t, pose_math::Pose * out)
     }
     // t ∈ [oldest, newest]: 定位相邻两样本
     auto it = std::lower_bound(
-        buf_.begin(), buf_.end(), t,
-        [](const OdomSample & s, double tv) { return s.t < tv; });
-    if (it->t == t || it == buf_.begin()) {
+        buf_.begin(), buf_.end(), t.s,
+        [](const OdomSample & s, double tv) { return s.t.s < tv; });
+    if (it->t.s == t.s || it == buf_.begin()) {
         *out = it->pose;
         return QueryResult::OK;
     }
     const OdomSample & s1 = *it;
     const OdomSample & s0 = *(it - 1);
-    const double u = (t - s0.t) / (s1.t - s0.t);    // s1.t > s0.t 由 push 保证
+    const double u = (t.s - s0.t.s) / (s1.t.s - s0.t.s);    // s1.t > s0.t 由 push 保证
     pose_math::Pose interp;
     for (int i = 0; i < 3; ++i) {
         interp.p[i] = s0.pose.p[i] + u * (s1.pose.p[i] - s0.pose.p[i]);
@@ -94,7 +94,7 @@ OdomBuffer::QueryResult OdomBuffer::query(double t, pose_math::Pose * out)
     return QueryResult::OK;
 }
 
-void OdomBuffer::clear_and_settle(double settle_until)
+void OdomBuffer::clear_and_settle(SampleTime settle_until)
 {
     buf_.clear();
     settle_until_ = settle_until;

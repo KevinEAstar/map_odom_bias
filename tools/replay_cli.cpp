@@ -30,13 +30,16 @@
 #include "map_odom_bias/core/bias_estimator.hpp"
 #include "map_odom_bias/core/odom_buffer.hpp"
 #include "map_odom_bias/core/pose_math.hpp"
+#include "map_odom_bias/core/time_types.hpp"
 
 namespace pm = map_odom_bias::pose_math;
 using map_odom_bias::BiasEstimator;
 using map_odom_bias::BiasEstimatorParams;
 using map_odom_bias::BiasState;
 using map_odom_bias::OdomBuffer;
+using map_odom_bias::HostTime;
 using map_odom_bias::OdomSample;
+using map_odom_bias::SampleTime;
 
 namespace
 {
@@ -193,7 +196,7 @@ int main(int argc, char ** argv)
     };
 
     auto do_tick = [&](double t) {
-        est.tick(t, eval_pts());
+        est.tick(HostTime{t}, eval_pts());
         if (t - t_last_tick_log >= 1.0) {    // 1 Hz 快照
             t_last_tick_log = t;
             std::vector<std::array<double, 3>> pts;
@@ -224,7 +227,7 @@ int main(int argc, char ** argv)
 
         if (t_o <= t_b && t_o <= t_r) {
             OdomSample s;
-            s.t = odom[io].t_hdr;
+            s.t = SampleTime{odom[io].t_hdr};
             s.pose = odom[io].pose;
             buffer.push(s);
             ++io;
@@ -232,7 +235,8 @@ int main(int argc, char ** argv)
             const ObsRow & row = obs[ib];
             pm::Pose odom_base;
             const bool ok =
-                buffer.query(row.t_hdr, &odom_base) == OdomBuffer::QueryResult::OK;
+                buffer.query(SampleTime{row.t_hdr}, &odom_base) ==
+                OdomBuffer::QueryResult::OK;
             if (ok) {
                 // tf 模式: 观测变换现成 (p_ob 仍需配对提供评估点);
                 // pose 模式: 由位姿对构造 4DoF 偏差观测
@@ -245,10 +249,13 @@ int main(int argc, char ** argv)
                     t_obs, raw, std::vector<std::array<double, 3>>{});
                 const pm::TransformError e_body = pm::transform_error(
                     t_obs, raw, std::vector<std::array<double, 3>>{odom_base.p});
+                // 采样刻 = header 戳, 到达刻 = bag 写入戳 (回放保真)
                 if (body_metric) {
-                    est.add_observation(t_obs, row.t_hdr, odom_base.p);
+                    est.add_observation(t_obs, SampleTime{row.t_hdr},
+                                        HostTime{row.t_bag}, odom_base.p);
                 } else {
-                    est.add_observation(t_obs, row.t_hdr);
+                    est.add_observation(t_obs, SampleTime{row.t_hdr},
+                                        HostTime{row.t_bag});
                 }
                 f_obs << row.t_bag << ',' << row.t_hdr << ",1,"
                       << static_cast<int>(est.state()) << ','
@@ -285,7 +292,8 @@ int main(int argc, char ** argv)
                     pm::make_heading_reset_delta(dpsi, p_ob), d_total);
             }
             est.apply_reset(d_total);
-            buffer.clear_and_settle(r.t_bag + kSettleDuration);
+            buffer.clear_and_settle(
+                SampleTime{r.t_bag + kSettleDuration});
             ++ir;
         }
     }
