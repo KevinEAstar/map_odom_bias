@@ -20,18 +20,29 @@ include/map_odom_bias/core/   纯逻辑核心 (零 ROS 依赖, 单测全覆盖)
     pose_math       4DoF 变换数学 + 偏差观测构造 + 机体点残差度量
     odom_buffer     odom 历史缓冲 + 时间戳对齐插值
     bias_estimator  状态机 + 门控 + 双轨吸收 + reset 补偿
-(规划中) ros/        ROS 2 壳: 订阅适配 / 发布 / 参数装载 / ResetSource 接入点
+include/map_odom_bias/ros/    ROS 2 壳 (1 节点)
+    map_odom_bias_node   薄壳: 消息进出 / 参数装载 / 定时器, 无算法逻辑
+    px4_reset_source     PX4 EKF reset 接入层 (可替换 ResetSource 形态,
+                         px4_msgs 依赖隔离于此; 非 PX4 系统替换本类)
+msg/BiasStatus.msg            健康信号 (状态机 / divergence / 各类计数)
 (规划中) tools/      消费者工具件 (header-only): Anchored/Rebasable / reset 握手
 ```
 
+度量口径（机体点残差）：门控在本帧观测配对的机体 odom 位置处评估残差，
+吸收钳位与 divergence 在 odom 缓冲最新样本位置处评估——yaw 解算噪声经
+力臂放大为平移伪差的路径全部关闭；缓冲空时退化为参数空间度量并计数。
+
 ## 构建与测试
 
-ROS 2 Humble / C++14：
+ROS 2 Humble / C++14；需要 px4_msgs overlay（版本须匹配固件，由部署环境
+提供，例如主项目工作空间 install）：
 
 ```bash
 source /opt/ros/humble/setup.bash
+source <px4_msgs_ws>/install/setup.bash
 colcon build --packages-select map_odom_bias
 colcon test --packages-select map_odom_bias && colcon test-result --verbose
+ros2 launch map_odom_bias map_odom_bias.launch.py   # node_name:= 可冒充原节点
 ```
 
 ## 血统
