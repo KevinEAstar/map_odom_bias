@@ -17,6 +17,7 @@
 #define MAP_ODOM_BIAS__CORE__POSE_MATH_HPP_
 
 #include <array>
+#include <vector>
 
 namespace map_odom_bias
 {
@@ -88,6 +89,31 @@ Pose apply_to_pose(const Transform4D & t, const Pose & pose);
  * @param odom_base 同一时刻机体在 odom 系的位姿 (OdomBuffer 插值)
  */
 Transform4D bias_observation(const Pose & map_base, const Pose & odom_base);
+
+/// 机体点残差度量的结果: 评估点集上的最大位置差 + yaw 最短角差
+struct TransformError
+{
+    double trans{0.0};
+    double yaw{0.0};
+};
+
+/**
+ * @brief 两变换在评估点集上的机体点残差度量 (设计文档 v1 四节, ③修法核心)
+ *
+ *   trans = max over p ∈ eval_points ‖apply(a,p) − apply(b,p)‖
+ *   yaw   = |wrap(a.yaw − b.yaw)|                (与评估点无关)
+ *
+ * 与变换参数空间直接差值 (‖a.t − b.t‖) 的区别: 参数空间平移差吃 yaw
+ * 噪声 × 力臂 |p| 的放大 (δψ 经 Rz 注入平移伪差 ≈ 2·sin(δψ/2)·|p_horiz|),
+ * 而在机体点 p_ob 处评估时该贡献恒零 —— 恒等式 apply(T_obs, p_ob) ≡ p_mb
+ * 保证观测本身就是该点的直接测量 (与 MRS innovation z−Hx 同构)。
+ *
+ * @param eval_points 机体评估点集 (odom 系); 空集退化为在原点评估
+ *        (= 参数空间平移差), 供消费侧 odom 缓冲为空时的回退路径
+ */
+TransformError transform_error(
+    const Transform4D & a, const Transform4D & b,
+    const std::vector<std::array<double, 3>> & eval_points);
 
 /**
  * @brief EKF 航向 reset 的 odom 系改写增量 D (详设 4.6)

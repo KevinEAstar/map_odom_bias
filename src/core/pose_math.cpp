@@ -5,6 +5,7 @@
 
 #include "map_odom_bias/core/pose_math.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 namespace map_odom_bias
@@ -158,6 +159,32 @@ Transform4D bias_observation(const Pose & map_base, const Pose & odom_base)
     t_ob.z = odom_base.p[2];
     t_ob.yaw = yaw_from_quat(odom_base.q);
     return compose(t_mb, inverse(t_ob));
+}
+
+TransformError transform_error(
+    const Transform4D & a, const Transform4D & b,
+    const std::vector<std::array<double, 3>> & eval_points)
+{
+    TransformError err;
+    err.yaw = std::fabs(wrap_angle(a.yaw - b.yaw));
+    if (eval_points.empty()) {
+        // 空集 = 在原点评估: apply(·, 0) 的差即参数空间平移差
+        const double dx = a.x - b.x;
+        const double dy = a.y - b.y;
+        const double dz = a.z - b.z;
+        err.trans = std::sqrt(dx * dx + dy * dy + dz * dz);
+        return err;
+    }
+    for (const auto & p : eval_points) {
+        const std::array<double, 3> pa = apply(a, p);
+        const std::array<double, 3> pb = apply(b, p);
+        const double dx = pa[0] - pb[0];
+        const double dy = pa[1] - pb[1];
+        const double dz = pa[2] - pb[2];
+        err.trans = std::max(err.trans,
+                             std::sqrt(dx * dx + dy * dy + dz * dz));
+    }
+    return err;
 }
 
 Transform4D make_heading_reset_delta(double dpsi_enu,

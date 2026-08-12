@@ -34,6 +34,11 @@ if(BUILD_TESTING)
   # 会把生成物一并扫描产生海量误报 —— 本仓只跑 gtest, 不挂 lint_auto
   find_package(ament_cmake_gtest REQUIRED)
 
+  ament_add_gtest(test_pose_math
+    test/test_pose_math.cpp
+  )
+  target_link_libraries(test_pose_math map_odom_bias_core)
+
   ament_add_gtest(test_odom_buffer
     test/test_odom_buffer.cpp
   )
