@@ -66,6 +66,10 @@ install(DIRECTORY
   include/
   DESTINATION include
 )
+# ===== 台架工具 (零 ROS 依赖, 离线回放判卷) =====
+add_executable(replay_cli tools/replay_cli.cpp)
+target_link_libraries(replay_cli map_odom_bias_core)
+install(TARGETS replay_cli DESTINATION lib/${PROJECT_NAME})
 # ===== 测试 =====
 if(BUILD_TESTING)
   # 独立仓根直接 colcon 构建, build/install 落在包目录内, ament_lint_auto
