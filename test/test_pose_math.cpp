@@ -215,9 +215,3 @@ TEST(TransformError, YawChannelIndependentOfPoints)
         pm::transform_error(a, b, std::vector<std::array<double, 3>>{});
     EXPECT_NEAR(err_empty.yaw, err.yaw, 1e-12);
 }
-
-int main(int argc, char ** argv)
-{
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}

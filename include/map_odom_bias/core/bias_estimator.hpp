@@ -76,8 +76,12 @@ public:
 
     /**
      * @brief 喂入一帧 4DoF 偏差观测 (pose_math::bias_observation 的输出)
-     * @param obs 观测到的 T_map_odom (4DoF)
-     * @param t   观测时刻 (图像戳), 本地 ROS 钟, 秒
+     * @param obs  观测到的 T_map_odom (4DoF)
+     * @param t    观测时刻 (图像戳), 本地 ROS 钟, 秒
+     * @param p_ob 本帧机体在 odom 系的位置 (bias_observation 的 odom_base
+     *             位置) —— 门控在该点做机体点残差度量 (③修法, 设计文档 v1
+     *             四节): yaw 解算噪声经力臂 |p_ob| 的平移伪差在此度量下
+     *             恒零, 真平移误差如实计量。默认原点 = 参数空间旧度量。
      *
      * 状态机行为:
      *   UNINITIALIZED → 进入 INITIALIZING (obs 为首个初始化候选)
@@ -88,20 +92,28 @@ public:
      *                   TRACKING (详设 4.7: 恢复走门控, 长断流后的漂移偏差
      *                   按候选路径数帧确认, 正好是期望行为)
      */
-    void add_observation(const pose_math::Transform4D & obs, double t);
+    void add_observation(const pose_math::Transform4D & obs, double t,
+                         const std::array<double, 3> & p_ob = {{0.0, 0.0, 0.0}});
 
     /**
      * @brief 定时步进 (tf_publish_rate 驱动): STALE 判定 + ctrl/cmd 双通道吸收
      * @param t_now 当前时刻, 要求单调不减
+     * @param eval_points 机体评估点集 (通常 = OdomBuffer 最新样本位置);
+     *        钳位预算在此点集度量 —— 物理语义为"机体 setpoint 被拉动的
+     *        速率 ≤ rate_trans" (③修法, yaw 步进经力臂的拉动计入同一预算)。
+     *        空集退化为原点评估 = 参数空间旧钳位 (缓冲空的回退路径)。
      *
      * 吸收律 (详设 4.5, ctrl/cmd 同律不同参): alpha = dt/τ;
-     * delta = raw − state (yaw 最短角); 步进量 clamp —— 平移按向量范数
-     * 限幅 ≤ rate_trans·dt (保方向缩模长), yaw 独立限幅 ≤ rate_yaw·dt。
+     * delta = raw − state (yaw 最短角); 步进量 clamp —— yaw 先独立限幅
+     * ≤ rate_yaw·dt, 再按机体点位移预算 ≤ rate_trans·dt 全通道等比缩步
+     * (保方向缩模长)。
      * ctrl 用 absorb_time_constant / max_correction_rate_*;
      * cmd 用 cmd_absorb_time_constant / cmd_max_correction_rate_* (快通道)。
      * 仅 TRACKING 状态步进; STALE 双通道冻结 (断流时变换保持最后估计)。
      */
-    void tick(double t_now);
+    void tick(double t_now,
+              const std::vector<std::array<double, 3>> & eval_points =
+                  std::vector<std::array<double, 3>>());
 
     /**
      * @brief EKF reset 瞬跳补偿 (详设 4.6)
@@ -122,12 +134,18 @@ public:
     const pose_math::Transform4D & cmd() const { return cmd_; }
 
     // ---- 健康信号数据源 (详设 4.8) ----
-    /// raw 与 ctrl 的平移差范数
-    double divergence_trans() const;
-    /// raw 与 ctrl 的 yaw 差 (最短角, 绝对值)
+    /// raw 与 ctrl 在评估点集上的位置分歧 (③修法: "感知位置与指令位置
+    /// 在机体处的分歧", 分歧门消费的本义); 空集 = 参数空间平移差范数
+    double divergence_trans(
+        const std::vector<std::array<double, 3>> & eval_points =
+            std::vector<std::array<double, 3>>()) const;
+    /// raw 与 ctrl 的 yaw 差 (最短角, 绝对值; 不吃力臂, 无评估点)
     double divergence_yaw() const;
-    /// cmd 与 ctrl 的平移差范数 = 出口快通道当前修正量 (B 作用量监控)
-    double divergence_cmd_trans() const;
+    /// cmd 与 ctrl 在评估点集上的位置分歧 = 出口快通道当前修正量
+    /// (B 作用量监控); 空集 = 参数空间平移差范数
+    double divergence_cmd_trans(
+        const std::vector<std::array<double, 3>> & eval_points =
+            std::vector<std::array<double, 3>>()) const;
     /// cmd 与 ctrl 的 yaw 差 (最短角, 绝对值)
     double divergence_cmd_yaw() const;
     /// 最后一帧被账本采纳的观测时刻 (obs_age = now − last_obs_time);
@@ -151,10 +169,12 @@ public:
     double last_reset_yaw() const { return last_reset_yaw_; }
 
 private:
-    /// 两帧 4DoF 的接近性判定 (平移范数与 yaw 最短角差均小于给定门限)
-    static bool within(const pose_math::Transform4D & a,
-                       const pose_math::Transform4D & b,
-                       double trans_th, double yaw_th);
+    /// 两帧 4DoF 的接近性判定: 在机体点 p_ob 处的位置残差与 yaw 最短角差
+    /// 均小于给定门限 (③修法: 度量空间 = 机体位置误差空间)
+    static bool within_at(const pose_math::Transform4D & a,
+                          const pose_math::Transform4D & b,
+                          const std::array<double, 3> & p_ob,
+                          double trans_th, double yaw_th);
     /// 候选均值 (平移逐轴; yaw 以首帧为基准的相对角均值, 防环绕)
     static pose_math::Transform4D mean_of(
         const std::vector<pose_math::Transform4D> & c);
@@ -162,7 +182,8 @@ private:
     static pose_math::Transform4D median_of(
         const std::deque<pose_math::Transform4D> & w);
 
-    void gate_and_update(const pose_math::Transform4D & obs, double t);
+    void gate_and_update(const pose_math::Transform4D & obs, double t,
+                         const std::array<double, 3> & p_ob);
     /// 正常路径采纳: raw_median_window > 1 时经中值窗口去毛刺
     void accept_raw(const pose_math::Transform4D & obs);
     /// raw 基准跳变 (跳变确认/初始化/reset 补偿) 后重置中值窗口
@@ -173,10 +194,12 @@ private:
     BiasEstimatorParams params_;
     BiasState state_{BiasState::UNINITIALIZED};
 
-    /// 单通道吸收步进 (ctrl/cmd 共用律): state += clamp(delta·dt/τ)
+    /// 单通道吸收步进 (ctrl/cmd 共用律): state += clamp(delta·dt/τ),
+    /// 平移预算在 eval_points 上以机体点位移度量
     static void absorb_toward(const pose_math::Transform4D & target,
                               pose_math::Transform4D & state, double dt,
-                              double tau, double rate_trans, double rate_yaw);
+                              double tau, double rate_trans, double rate_yaw,
+                              const std::vector<std::array<double, 3>> & eval_points);
 
     pose_math::Transform4D raw_;
     pose_math::Transform4D ctrl_;

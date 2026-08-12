@@ -794,3 +794,93 @@ TEST_F(BiasEstimatorTest, CmdResetCompensatedWithRawAndCtrl)
     expect_pose_near(pm::apply_to_pose(e.cmd(), odom_new), map_before_cmd, 1e-12);
     EXPECT_NEAR(e.divergence_cmd_trans(), div_before, 1e-12);
 }
+
+// ---- ③度量空间修法: 机体点残差门控 / 钳位预算 / divergence ----
+// (设计文档 v1 四节 4.3; 默认参数 = 原点评估 = 参数空间旧行为,
+//  上面全部既有用例即修法的行为兼容回归)
+
+TEST_F(BiasEstimatorTest, GateAtBodyPointYawNoiseWithLeverArmNotRejected)
+{
+    // 08-06 风暴工况: 力臂 r_horiz=5m, yaw 解算噪声 4° → 变换参数空间
+    // 平移伪差 2·sin(2°)·5 ≈ 0.35m 超 0.3 门限 (旧度量整帧被拒);
+    // 机体点残差恒零 + yaw 差 4° < 10° 门限 → 应正常采纳
+    BiasEstimator e(params_);
+    const pm::Transform4D t_true = t4(0.2, -0.1, 0.0, 0.15);
+    const std::array<double, 3> p_ob = {{4.0, 3.0, 0.5}};    // r_horiz = 5
+    for (int i = 0; i < params_.init_confirm_frames; ++i) {
+        t_ += kObsDt;
+        e.add_observation(t_true, t_, p_ob);
+    }
+    ASSERT_EQ(e.state(), BiasState::TRACKING);
+
+    pm::Pose ob;
+    ob.p = p_ob;
+    ob.q = pm::quat_from_yaw(0.9);
+    pm::Pose mb = pm::apply_to_pose(t_true, ob);
+    mb.q = pm::quat_normalize(
+        pm::quat_mul(pm::quat_from_yaw(4.0 * pm::kPi / 180.0), mb.q));
+    const pm::Transform4D obs = pm::bias_observation(mb, ob);
+    // 前置自检: 参数空间平移伪差确实超门限 (旧度量下该帧会被拒)
+    ASSERT_GT(std::hypot(obs.x - t_true.x, obs.y - t_true.y),
+              params_.gate_trans_threshold);
+
+    t_ += kObsDt;
+    e.add_observation(obs, t_, p_ob);
+    EXPECT_EQ(e.gate_reject_count(), 0u);
+    EXPECT_NEAR(e.raw().x, obs.x, 1e-12);    // 正常路径原值采纳
+    EXPECT_NEAR(e.raw().yaw, obs.yaw, 1e-12);
+}
+
+TEST_F(BiasEstimatorTest, GateAtBodyPointTrueTranslationStillRejected)
+{
+    // 机体点度量不放走真平移野值: 0.5m 平移突变在任意力臂下仍超门限
+    BiasEstimator e(params_);
+    const std::array<double, 3> p_ob = {{4.0, 3.0, 0.5}};
+    for (int i = 0; i < params_.init_confirm_frames; ++i) {
+        t_ += kObsDt;
+        e.add_observation(t4(0.0, 0.0, 0.0, 0.0), t_, p_ob);
+    }
+    ASSERT_EQ(e.state(), BiasState::TRACKING);
+    t_ += kObsDt;
+    e.add_observation(t4(0.5, 0.0, 0.0, 0.0), t_, p_ob);
+    EXPECT_NEAR(e.raw().x, 0.0, 1e-12);    // 未入账本 (走候选队列)
+}
+
+TEST_F(BiasEstimatorTest, AbsorbClampBudgetAtBodyPoint)
+{
+    // raw 与 ctrl 差纯 yaw 0.1 rad, 力臂 10m: 参数空间旧钳位平移步进
+    // 为零不触发, yaw 仅受 rate_yaw 限幅 → 机体点每拍被拉
+    // ~0.17·0.02·10 = 0.034m 远超平移预算 0.2·0.02 = 0.004m;
+    // 机体点预算钳位: setpoint 被拉动速率 ≤ max_correction_rate_trans
+    BiasEstimator e(params_);
+    init_to(e, t4(0.0, 0.0, 0.0, 0.0));
+    feed(e, t4(0.0, 0.0, 0.0, 0.1), 1);    // yaw 0.1 < 门限 → 采纳
+    ASSERT_NEAR(e.raw().yaw, 0.1, 1e-12);
+    run_ticks(e, 1);    // 首拍建 tick 基准 (dt=0 无步进), 后续每拍 dt=kTickDt
+
+    const std::vector<std::array<double, 3>> eval = {{{10.0, 0.0, 0.0}}};
+    for (int i = 0; i < 50; ++i) {
+        const pm::Transform4D before = e.ctrl();
+        t_ += kTickDt;
+        e.tick(t_, eval);
+        const pm::TransformError moved =
+            pm::transform_error(e.ctrl(), before, eval);
+        EXPECT_LE(moved.trans,
+                  params_.max_correction_rate_trans * kTickDt + 1e-9);
+    }
+    EXPECT_GT(e.ctrl().yaw, 0.0);    // 预算内仍在收敛, 非死锁
+}
+
+TEST_F(BiasEstimatorTest, DivergenceAtBodyPoint)
+{
+    // raw/ctrl 纯 yaw 分歧 0.1 rad 在 6m 力臂处 = 感知与指令位置分歧
+    // 2·sin(0.05)·6; 参数空间口径 (无参默认) 看不见该分歧
+    BiasEstimator e(params_);
+    init_to(e, t4(0.0, 0.0, 0.0, 0.0));
+    feed(e, t4(0.0, 0.0, 0.0, 0.1), 1);    // raw 更新, 无 tick 不吸收
+    const std::vector<std::array<double, 3>> eval = {{{6.0, 0.0, 0.0}}};
+    EXPECT_NEAR(e.divergence_trans(), 0.0, 1e-12);
+    EXPECT_NEAR(e.divergence_trans(eval), 2.0 * std::sin(0.05) * 6.0, 1e-9);
+    EXPECT_NEAR(e.divergence_yaw(), 0.1, 1e-12);
+    EXPECT_NEAR(e.divergence_cmd_trans(eval), 0.0, 1e-12);    // cmd==ctrl
+}

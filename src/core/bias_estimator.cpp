@@ -18,15 +18,16 @@ BiasEstimator::BiasEstimator(const BiasEstimatorParams & params)
 {
 }
 
-bool BiasEstimator::within(const pm::Transform4D & a, const pm::Transform4D & b,
-                           double trans_th, double yaw_th)
+bool BiasEstimator::within_at(const pm::Transform4D & a,
+                              const pm::Transform4D & b,
+                              const std::array<double, 3> & p_ob,
+                              double trans_th, double yaw_th)
 {
-    const double dx = a.x - b.x;
-    const double dy = a.y - b.y;
-    const double dz = a.z - b.z;
-    const double dt = std::sqrt(dx * dx + dy * dy + dz * dz);
-    const double dyaw = std::fabs(pm::wrap_angle(a.yaw - b.yaw));
-    return dt <= trans_th && dyaw <= yaw_th;
+    // ③修法: 机体点残差度量 —— 在 p_ob 处评估两变换的位置差,
+    // yaw 解算噪声经力臂的平移伪差在此度量下恒零 (设计文档 v1 4.2)
+    const pm::TransformError err = pm::transform_error(
+        a, b, std::vector<std::array<double, 3>>{p_ob});
+    return err.trans <= trans_th && err.yaw <= yaw_th;
 }
 
 pm::Transform4D BiasEstimator::median_of(const std::deque<pm::Transform4D> & w)
@@ -75,13 +76,16 @@ pm::Transform4D BiasEstimator::mean_of(const std::vector<pm::Transform4D> & c)
     return m;
 }
 
-void BiasEstimator::add_observation(const pm::Transform4D & obs, double t)
+void BiasEstimator::add_observation(const pm::Transform4D & obs, double t,
+                                    const std::array<double, 3> & p_ob)
 {
     // 有限性守卫: NaN/inf 观测一旦进账本, 门控比较对 NaN 恒 false 且
     // 速率 clamp 失效, raw/ctrl 无法恢复 —— 在唯一入口拦截
     if (!(std::isfinite(obs.x) && std::isfinite(obs.y) &&
           std::isfinite(obs.z) && std::isfinite(obs.yaw) &&
-          std::isfinite(t))) {
+          std::isfinite(t) &&
+          std::isfinite(p_ob[0]) && std::isfinite(p_ob[1]) &&
+          std::isfinite(p_ob[2]))) {
         ++invalid_obs_count_;
         return;
     }
@@ -100,9 +104,9 @@ void BiasEstimator::add_observation(const pm::Transform4D & obs, double t)
             // 候选可能被 reset 清空 (apply_reset), 此时 obs 成为新起点。
             last_obs_time_ = t;    // 初始化候选均视为有效观测
             if (!init_candidates_.empty() &&
-                within(obs, init_candidates_.back(),
-                       params_.gate_trans_threshold * 0.5,
-                       params_.gate_yaw_threshold * 0.5)) {
+                within_at(obs, init_candidates_.back(), p_ob,
+                          params_.gate_trans_threshold * 0.5,
+                          params_.gate_yaw_threshold * 0.5)) {
                 init_candidates_.push_back(obs);
                 if (static_cast<int>(init_candidates_.size()) >=
                     params_.init_confirm_frames) {
@@ -122,18 +126,21 @@ void BiasEstimator::add_observation(const pm::Transform4D & obs, double t)
 
         case BiasState::TRACKING:
         case BiasState::STALE:
-            gate_and_update(obs, t);
+            gate_and_update(obs, t, p_ob);
             return;
     }
 }
 
-void BiasEstimator::gate_and_update(const pm::Transform4D & obs, double t)
+void BiasEstimator::gate_and_update(const pm::Transform4D & obs, double t,
+                                    const std::array<double, 3> & p_ob)
 {
     // 正常路径 (详设 4.4 第 1 条): 观测与 raw 的偏差在门限内 → 账本采纳。
+    // 度量在本帧机体点 p_ob 处评估 (③修法): "账本预测的机体 map 位置 vs
+    // 观测的机体 map 位置", yaw 噪声力臂贡献恒零。
     // last_obs_time 只在观测被账本采纳时刷新 —— 被拒绝的观测不算"有效",
     // 误检风暴下账本停更, obs_age 增长直至 STALE 告警 (详设 v2.1, F02)
-    if (within(obs, raw_, params_.gate_trans_threshold,
-               params_.gate_yaw_threshold)) {
+    if (within_at(obs, raw_, p_ob, params_.gate_trans_threshold,
+                  params_.gate_yaw_threshold)) {
         // 被正常路径清空的候选 = 被抛弃的观测, 按帧数计入拒绝 (F13)
         gate_reject_count_ += static_cast<uint32_t>(gate_candidates_.size());
         gate_candidates_.clear();
@@ -147,9 +154,9 @@ void BiasEstimator::gate_and_update(const pm::Transform4D & obs, double t)
 
     // 候选路径 (第 2/3 条)
     if (!gate_candidates_.empty() &&
-        within(obs, gate_candidates_.back(),
-               params_.gate_trans_threshold * 0.5,
-               params_.gate_yaw_threshold * 0.5)) {
+        within_at(obs, gate_candidates_.back(), p_ob,
+                  params_.gate_trans_threshold * 0.5,
+                  params_.gate_yaw_threshold * 0.5)) {
         // 与队列内候选一致 → 累积
         gate_candidates_.push_back(obs);
         if (static_cast<int>(gate_candidates_.size()) >=
@@ -212,7 +219,8 @@ void BiasEstimator::record_jump(const pm::Transform4D & old_raw,
 
 void BiasEstimator::absorb_toward(const pm::Transform4D & target,
                                   pm::Transform4D & state, double dt,
-                                  double tau, double rate_trans, double rate_yaw)
+                                  double tau, double rate_trans, double rate_yaw,
+                                  const std::vector<std::array<double, 3>> & eval_points)
 {
     // 吸收律 (详设 4.5, ctrl/cmd 共用): 一阶低通 + 速率硬上限
     const double alpha = dt / tau;
@@ -221,18 +229,34 @@ void BiasEstimator::absorb_toward(const pm::Transform4D & target,
     double step_z = (target.z - state.z) * alpha;
     double step_yaw = pm::wrap_angle(target.yaw - state.yaw) * alpha;
 
-    // 平移按向量范数限幅 (保方向缩模长, 详设伪代码的按通道取值落地口径)
-    const double norm = std::sqrt(step_x * step_x + step_y * step_y +
-                                  step_z * step_z);
+    // yaw 先走独立预算
+    const double yaw_limit = rate_yaw * dt;
+    step_yaw = std::max(-yaw_limit, std::min(yaw_limit, step_yaw));
+
+    // 平移预算以机体点位移度量 (③修法, 设计文档 v1 4.3-2): 物理语义 =
+    // "机体 setpoint 被拉动的速率 ≤ rate_trans", yaw 步进经力臂的拉动
+    // 计入同一预算 → 超限时全通道等比缩步 (保方向缩模长)。
+    // 空 eval_points 退化为原点评估 = 参数空间旧钳位 (缓冲空回退路径)。
+    // 两轮缩放: yaw 弦长对缩放系数是凹函数, 一轮线性缩放后实际位移可略
+    // 超预算 (残差 ~ r·ψ³/24, ψ ≤ rate_yaw·max_tick_dt), 第二轮吃掉残差
     const double trans_limit = rate_trans * dt;
-    if (norm > trans_limit && norm > 0.0) {
-        const double scale = trans_limit / norm;
+    for (int pass = 0; pass < 2; ++pass) {
+        pm::Transform4D cand = state;
+        cand.x += step_x;
+        cand.y += step_y;
+        cand.z += step_z;
+        cand.yaw = pm::wrap_angle(state.yaw + step_yaw);
+        const double moved =
+            pm::transform_error(cand, state, eval_points).trans;
+        if (moved <= trans_limit || moved <= 0.0) {
+            break;
+        }
+        const double scale = trans_limit / moved;
         step_x *= scale;
         step_y *= scale;
         step_z *= scale;
+        step_yaw *= scale;
     }
-    const double yaw_limit = rate_yaw * dt;
-    step_yaw = std::max(-yaw_limit, std::min(yaw_limit, step_yaw));
 
     state.x += step_x;
     state.y += step_y;
@@ -240,7 +264,8 @@ void BiasEstimator::absorb_toward(const pm::Transform4D & target,
     state.yaw = pm::wrap_angle(state.yaw + step_yaw);
 }
 
-void BiasEstimator::tick(double t_now)
+void BiasEstimator::tick(double t_now,
+                         const std::vector<std::array<double, 3>> & eval_points)
 {
     // dt 防御: 首拍只记基准; 时钟回退刷新基准; 单拍上限 max_tick_dt
     // (定时器挂起恢复时防 ctrl/cmd 单步大跳)
@@ -262,10 +287,10 @@ void BiasEstimator::tick(double t_now)
     // ctrl 慢通道 (感知侧, 稳) 与 cmd 快通道 (指令侧, 贴 raw) 同律不同参
     absorb_toward(raw_, ctrl_, dt, params_.absorb_time_constant,
                   params_.max_correction_rate_trans,
-                  params_.max_correction_rate_yaw);
+                  params_.max_correction_rate_yaw, eval_points);
     absorb_toward(raw_, cmd_, dt, params_.cmd_absorb_time_constant,
                   params_.cmd_max_correction_rate_trans,
-                  params_.cmd_max_correction_rate_yaw);
+                  params_.cmd_max_correction_rate_yaw, eval_points);
 }
 
 void BiasEstimator::apply_reset(const pm::Transform4D & d)
@@ -300,12 +325,12 @@ void BiasEstimator::apply_reset(const pm::Transform4D & d)
     reseed_raw_window();         // 中值窗口内历史观测同属旧坐标系
 }
 
-double BiasEstimator::divergence_trans() const
+double BiasEstimator::divergence_trans(
+    const std::vector<std::array<double, 3>> & eval_points) const
 {
-    const double dx = raw_.x - ctrl_.x;
-    const double dy = raw_.y - ctrl_.y;
-    const double dz = raw_.z - ctrl_.z;
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
+    // ③修法: "感知位置与指令位置在机体处的分歧" —— raw/ctrl 的 yaw 分歧
+    // 经力臂产生的机体位置分歧计入; 空集 = 参数空间平移差 (旧口径)
+    return pm::transform_error(raw_, ctrl_, eval_points).trans;
 }
 
 double BiasEstimator::divergence_yaw() const
@@ -313,12 +338,10 @@ double BiasEstimator::divergence_yaw() const
     return std::fabs(pm::wrap_angle(raw_.yaw - ctrl_.yaw));
 }
 
-double BiasEstimator::divergence_cmd_trans() const
+double BiasEstimator::divergence_cmd_trans(
+    const std::vector<std::array<double, 3>> & eval_points) const
 {
-    const double dx = cmd_.x - ctrl_.x;
-    const double dy = cmd_.y - ctrl_.y;
-    const double dz = cmd_.z - ctrl_.z;
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
+    return pm::transform_error(cmd_, ctrl_, eval_points).trans;
 }
 
 double BiasEstimator::divergence_cmd_yaw() const
