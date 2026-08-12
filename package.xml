@@ -7,8 +7,19 @@
   <maintainer email="2671964674@qq.com">Entropix-rore</maintainer>
   <license>TODO: License declaration</license>
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
 
-  <!-- v1 核心库阶段零运行时依赖; ROS 壳迁入时再追加 rclcpp/geometry_msgs 等 -->
+  <!-- 核心库零 ROS 依赖; 以下为 ROS 壳与消息 -->
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>tf2_ros</depend>
+  <!-- Px4ResetSource 接入层专用 (非 PX4 系统替换该类即可摘除) -->
+  <depend>px4_msgs</depend>
+
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <member_of_group>rosidl_interface_packages</member_of_group>
 
   <!-- 仅测试时需要 -->
   <test_depend>ament_cmake_gtest</test_depend>

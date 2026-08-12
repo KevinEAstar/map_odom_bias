@@ -1,0 +1,42 @@
+# map_odom_bias 节点参数 (详设 3.3 参数表, 默认值 = 设计初值)
+# 通配键: 节点以任意名字启动 (含冒充 tf_manager_node 做并行对照) 均加载
+/**:
+  ros__parameters:
+    # 观测与 odom 入口 topic (泛化资产: 按部署环境覆盖)
+    pose_topic: /aprilslam/pose
+    odometry_topic: /fc_bridge/odometry
+    # odom 历史缓冲时长 s; 640×400 档 0.2s 即够, 全分辨率形态需 ≥4s,
+    # 默认 4.0 覆盖两形态 (板端评测 2026-07-13)
+    odom_buffer_duration: 4.0
+    # 图像戳晚于最新 odom 时允许的外推上限 s
+    max_extrapolation: 0.05
+    # EKF reset 补偿后的静默窗口 s (两条订阅链路乱序防护)
+    reset_settle_duration: 0.05
+    # 初始化需连续一致的观测帧数
+    init_confirm_frames: 3
+    # 门控: 单帧观测相对 raw 的突变阈值。度量 = 机体点残差 (③修法):
+    # 账本预测的机体 map 位置 vs 观测的机体 map 位置, yaw 解算噪声不再
+    # 经力臂放大为平移伪差; 0.3 初值沿用, 台架回归定版 (裁决 B3)
+    gate_trans_threshold: 0.3
+    gate_yaw_threshold: 0.17
+    # 突变被采纳所需的连续一致帧数
+    gate_confirm_frames: 3
+    # ctrl 向 raw 收敛的时间常数 τ s (感知侧慢通道: 入口垂足/进度要稳)
+    absorb_time_constant: 5.0
+    # ctrl 修正速率硬上限。度量 = 机体点被拉动速率 (③修法, yaw 修正经
+    # 力臂的拉动计入同一预算)
+    max_correction_rate_trans: 0.2
+    max_correction_rate_yaw: 0.17
+    # ---- cmd 快通道 (出口: sp 逆变换贴 raw, 关稳态滞后欠账) ----
+    # 三参数设为 ctrl 同值 (5.0/0.2/0.17) 即 cmd≡ctrl = 回退旧行为
+    cmd_absorb_time_constant: 0.5
+    # cmd 修正速率上限需 > 漂移率 (实测 5~10cm/s), 否则重蹈 ctrl 顶死饱和
+    cmd_max_correction_rate_trans: 0.5
+    cmd_max_correction_rate_yaw: 0.5
+    # TF 广播与 ctrl 收敛步进频率 Hz
+    tf_publish_rate: 50.0
+    # 无有效观测超时进 STALE s (断流仅影响健康信号, 阈值宽松);
+    # "有效" = 被账本采纳的观测, 误检风暴下账本停更同样进 STALE
+    observation_timeout: 2.0
+    # raw 中值去毛刺窗口 (帧), 1 = 关闭 (默认不滤保持"监控要真")
+    raw_median_window: 1

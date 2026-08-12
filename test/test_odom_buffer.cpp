@@ -183,3 +183,16 @@ TEST(OdomBufferBoundary, EmptyBufferQueryCountsAsTooOld)
     EXPECT_EQ(buf.query(1.0, &out), OdomBuffer::QueryResult::EMPTY);
     EXPECT_EQ(buf.too_old_count(), 1u);
 }
+
+// ---- newest_pose: ③修法评估点来源 (最新样本位姿访问器) ----
+TEST(OdomBufferAccess, NewestPoseIsLastPushed)
+{
+    OdomBuffer buf(4.0, 0.05);
+    fill_sine(buf, 0.0, 0.5);
+    ASSERT_FALSE(buf.empty());
+    const OdomSample last = sample_at(0.5);
+    EXPECT_NEAR(buf.newest_pose().p[0], last.pose.p[0], 1e-12);
+    EXPECT_NEAR(buf.newest_pose().p[1], last.pose.p[1], 1e-12);
+    EXPECT_NEAR(buf.newest_pose().p[2], last.pose.p[2], 1e-12);
+    EXPECT_NEAR(buf.newest_time(), 0.5, 1e-12);
+}

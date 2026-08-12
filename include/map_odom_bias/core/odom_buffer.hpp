@@ -77,6 +77,9 @@ public:
     bool empty() const { return buf_.empty(); }
     double oldest_time() const { return buf_.empty() ? 0.0 : buf_.front().t; }
     double newest_time() const { return buf_.empty() ? 0.0 : buf_.back().t; }
+    /// 最新样本位姿 (③修法钳位/divergence 的机体评估点来源;
+    /// 调用方须先以 empty() 确认非空)
+    const pose_math::Pose & newest_pose() const { return buf_.back().pose; }
 
     // 健康计数 (详设 4.8: obs_too_old / obs_too_new 的数据源)
     uint32_t too_old_count() const { return too_old_count_; }
