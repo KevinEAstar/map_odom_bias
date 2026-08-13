@@ -39,4 +39,4 @@
     # "有效" = 被账本采纳的观测, 误检风暴下账本停更同样进 STALE
     observation_timeout: 2.0
     # raw 中值去毛刺窗口 (帧), 1 = 关闭 (默认不滤保持"监控要真")
-    raw_median_window: 1
+    median_window: 1        # v2: 中值窗迁 intake 链 (门控前), 1=关

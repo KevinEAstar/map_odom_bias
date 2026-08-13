@@ -26,7 +26,6 @@
 #define MAP_ODOM_BIAS__CORE__BIAS_ESTIMATOR_HPP_
 
 #include <cstdint>
-#include <deque>
 #include <vector>
 
 #include "map_odom_bias/core/pose_math.hpp"
@@ -64,8 +63,8 @@ struct BiasEstimatorParams
     double observation_timeout{2.0};        // s, 无有效观测超时进 STALE
                                             // ("有效"=被账本采纳, 详设 v2.1;
                                             // 误检风暴下账本停更同样进 STALE)
-    int raw_median_window{1};               // raw 中值去毛刺窗口, 1=关闭
-                                            // (默认不滤保持"监控要真")
+    // (raw_median_window 已迁出: 中值去毛刺 v2 起由 obs_intake 链上的
+    //  MedianWindow processor 承担, 位于门控前 —— 设计文档 v1 5.2)
     double max_tick_dt{0.2};                // s, 单拍步进 dt 防御上限 (定时器
                                             // 挂起恢复时防单步大跳, 实现防御项)
     // ---- v2 质量链: 三带门限 + 软降权 (设计文档 v1 4.4/5.3) ----
@@ -215,19 +214,12 @@ private:
     /// 候选均值 (平移逐轴; yaw 以首帧为基准的相对角均值, 防环绕)
     static pose_math::Transform4D mean_of(
         const std::vector<pose_math::Transform4D> & c);
-    /// 每通道独立中值 (yaw 以首元素为基准的相对角中值, 防环绕)
-    static pose_math::Transform4D median_of(
-        const std::deque<pose_math::Transform4D> & w);
 
     void gate_and_update(const pose_math::Transform4D & obs,
                          SampleTime t_sample, HostTime t_arrival,
                          const std::array<double, 3> & p_ob, double quality);
     /// 观测被账本采纳时的时序记账 (采样刻 + 到达刻 + 延迟)
     void note_observation(SampleTime t_sample, HostTime t_arrival);
-    /// 正常路径采纳: raw_median_window > 1 时经中值窗口去毛刺
-    void accept_raw(const pose_math::Transform4D & obs);
-    /// raw 基准跳变 (跳变确认/初始化/reset 补偿) 后重置中值窗口
-    void reseed_raw_window();
     void record_jump(const pose_math::Transform4D & old_raw,
                      const pose_math::Transform4D & new_raw);
 
@@ -250,7 +242,6 @@ private:
 
     std::vector<pose_math::Transform4D> init_candidates_;
     std::vector<pose_math::Transform4D> gate_candidates_;
-    std::deque<pose_math::Transform4D> raw_window_;    // 中值去毛刺窗口
 
     SampleTime last_obs_sample_;
     HostTime last_obs_arrival_;

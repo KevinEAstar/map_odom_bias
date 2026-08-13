@@ -57,31 +57,6 @@ bool BiasEstimator::within_at(const pm::Transform4D & a,
     return err.trans <= trans_th && err.yaw <= yaw_th;
 }
 
-pm::Transform4D BiasEstimator::median_of(const std::deque<pm::Transform4D> & w)
-{
-    // 每通道独立中值 (偶数窗口取中间两值平均); yaw 以首元素为基准的
-    // 相对角中值, 防 ±180° 环绕 (窗口内观测经门控约束, 相对角远离环绕点)
-    auto channel_median = [](std::vector<double> & v) {
-        std::sort(v.begin(), v.end());
-        const std::size_t n = v.size();
-        return (n % 2 == 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
-    };
-    std::vector<double> xs, ys, zs, yaws;
-    const double base_yaw = w.front().yaw;
-    for (const auto & t : w) {
-        xs.push_back(t.x);
-        ys.push_back(t.y);
-        zs.push_back(t.z);
-        yaws.push_back(pm::wrap_angle(t.yaw - base_yaw));
-    }
-    pm::Transform4D m;
-    m.x = channel_median(xs);
-    m.y = channel_median(ys);
-    m.z = channel_median(zs);
-    m.yaw = pm::wrap_angle(base_yaw + channel_median(yaws));
-    return m;
-}
-
 pm::Transform4D BiasEstimator::mean_of(const std::vector<pm::Transform4D> & c)
 {
     // yaw 以首帧为基准的相对角均值, 防 ±180° 环绕
@@ -156,7 +131,6 @@ void BiasEstimator::add_observation(const pm::Transform4D & obs,
                     ctrl_ = raw_;
                     cmd_ = raw_;
                     init_candidates_.clear();
-                    reseed_raw_window();
                     state_ = BiasState::TRACKING;
                 }
             } else {
@@ -196,7 +170,7 @@ void BiasEstimator::gate_and_update(const pm::Transform4D & obs,
         // 被正常路径清空的候选 = 被抛弃的观测, 按帧数计入拒绝 (F13)
         gate_reject_count_ += static_cast<uint32_t>(gate_candidates_.size());
         gate_candidates_.clear();
-        accept_raw(obs);
+        raw_ = obs;    // 账本采纳原值 (中值去毛刺 v2 起在 intake 链上, 门控前)
         note_observation(t_sample, t_arrival);
         current_quality_ =
             clamp01(quality) * (in_soft ? 1.0 : params_.band_quality);
@@ -221,7 +195,6 @@ void BiasEstimator::gate_and_update(const pm::Transform4D & obs,
             const pm::Transform4D old_raw = raw_;
             raw_ = mean_of(gate_candidates_);
             gate_candidates_.clear();
-            reseed_raw_window();
             record_jump(old_raw, raw_);
             note_observation(t_sample, t_arrival);
             // 跳变确认是拒绝带的出口 (合法重定位), 不属于降权带 —— 只记源质量
@@ -236,29 +209,6 @@ void BiasEstimator::gate_and_update(const pm::Transform4D & obs,
         gate_reject_count_ += static_cast<uint32_t>(gate_candidates_.size());
         gate_candidates_.clear();
         gate_candidates_.push_back(obs);
-    }
-}
-
-void BiasEstimator::accept_raw(const pm::Transform4D & obs)
-{
-    if (params_.raw_median_window <= 1) {
-        raw_ = obs;    // 默认: 不滤, 保持"监控要真"
-        return;
-    }
-    raw_window_.push_back(obs);
-    while (static_cast<int>(raw_window_.size()) > params_.raw_median_window) {
-        raw_window_.pop_front();
-    }
-    raw_ = median_of(raw_window_);
-}
-
-void BiasEstimator::reseed_raw_window()
-{
-    // raw 基准跳变 (初始化/跳变确认/reset 补偿) 后, 窗口内历史观测已
-    // 不代表新基准 → 以新 raw 为种子重建
-    raw_window_.clear();
-    if (params_.raw_median_window > 1) {
-        raw_window_.push_back(raw_);
     }
 }
 
@@ -389,7 +339,8 @@ void BiasEstimator::apply_reset(const pm::Transform4D & d)
     ctrl_ = pm::compose(ctrl_, d_inv);
     cmd_ = pm::compose(cmd_, d_inv);
     gate_candidates_.clear();    // 旧坐标系下的候选作废
-    reseed_raw_window();         // 中值窗口内历史观测同属旧坐标系
+    // (中值窗清空由宿主对 obs_intake 链 reset_all 完成 —— 节点在
+    //  apply_reset 路径已接线, 链上历史同属旧坐标系)
 }
 
 double BiasEstimator::divergence_trans(

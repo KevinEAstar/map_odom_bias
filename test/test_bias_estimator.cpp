@@ -667,23 +667,8 @@ TEST_F(BiasEstimatorTest, F20_CandidateMeanYawWrapSafe)
     EXPECT_GT(std::fabs(e.raw().yaw), 3.10);
 }
 
-// ---- F21: raw 中值去毛刺窗口 (raw_median_window=3) ----
-TEST_F(BiasEstimatorTest, F21_RawMedianWindowFiltersSpike)
-{
-    params_.raw_median_window = 3;
-    BiasEstimator e(params_);
-    init_to(e, t4(0, 0, 0, 0));
-    feed(e, t4(0.0, 0.0, 0.0, 0.0), 1);
-    // 单帧毛刺 (门限内, 会被正常路径采纳) 被中值窗口滤除
-    feed(e, t4(0.05, 0.0, 0.0, 0.0), 1);
-    EXPECT_NEAR(e.raw().x, 0.0, 1e-12);    // window {0, 0, 0.05} 中值 = 0
-    feed(e, t4(0.0, 0.0, 0.0, 0.0), 1);
-    EXPECT_NEAR(e.raw().x, 0.0, 1e-12);
-    // 持续的真实变化两帧后进账 (中值滤波的固有延迟)
-    feed(e, t4(0.05, 0.0, 0.0, 0.0), 1);
-    feed(e, t4(0.05, 0.0, 0.0, 0.0), 1);
-    EXPECT_NEAR(e.raw().x, 0.05, 1e-12);
-}
+// (F21 raw 中值窗口用例已随 MedianWindow 迁至 test_obs_intake —— 设计
+//  文档 v1 5.2: 中值去毛刺 v2 起在 intake 链上, 门控前)
 
 TEST_F(BiasEstimatorTest, ResetInStaleStillCompensates)
 {

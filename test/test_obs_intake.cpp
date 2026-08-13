@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <stdexcept>
 #include <memory>
 
 #include "map_odom_bias/core/obs_intake.hpp"
@@ -129,4 +130,124 @@ TEST(ObsIntake, ResetAllReachesEveryProcessor)
     intake.reset_all();
     EXPECT_EQ(a->resets, 1);
     EXPECT_EQ(b->resets, 1);
+}
+
+// ================= v2 质量链 processor (设计文档 v1 5.2) =================
+
+using map_odom_bias::MedianWindow;
+using map_odom_bias::TagCountQuality;
+namespace pm2 = map_odom_bias::pose_math;
+
+TEST(MedianWindow, FiltersSpikeKeepsSustainedChange)
+{
+    // 自估计器 F21 迁入 (行为保真, 位置改门控前): 单帧毛刺滤除,
+    // 持续真实变化经 ~window/2 帧延迟透传
+    BiasEstimator host{BiasEstimatorParams{}};
+    ObsIntake intake;
+    intake.add(std::unique_ptr<ObsProcessor>(new MedianWindow(3)));
+
+    auto run_x = [&](double x) {
+        GlobalPoseObservation o = make_obs(x);
+        EXPECT_TRUE(intake.run(o, host));
+        return o.T_obs.x;
+    };
+    EXPECT_NEAR(run_x(0.0), 0.0, 1e-12);
+    EXPECT_NEAR(run_x(0.0), 0.0, 1e-12);
+    EXPECT_NEAR(run_x(0.05), 0.0, 1e-12);    // {0,0,0.05} 中值 = 0 毛刺滤除
+    EXPECT_NEAR(run_x(0.0), 0.0, 1e-12);
+    EXPECT_NEAR(run_x(0.05), 0.05, 1e-12);   // {0.05,0,0.05} 持续变化进账
+    EXPECT_NEAR(run_x(0.05), 0.05, 1e-12);
+}
+
+TEST(MedianWindow, YawWrapSafeNearPi)
+{
+    // yaw 以窗口首元素为基准取相对角中值, ±π 环绕点附近不塌到 0
+    BiasEstimator host{BiasEstimatorParams{}};
+    ObsIntake intake;
+    intake.add(std::unique_ptr<ObsProcessor>(new MedianWindow(3)));
+
+    auto run_yaw = [&](double yaw) {
+        GlobalPoseObservation o = make_obs(0.0);
+        o.T_obs.yaw = yaw;
+        EXPECT_TRUE(intake.run(o, host));
+        return o.T_obs.yaw;
+    };
+    run_yaw(3.1);
+    run_yaw(-3.1);    // 与 3.1 相隔仅 0.083 rad (跨环绕点)
+    const double m = run_yaw(3.1);
+    EXPECT_NEAR(pm2::wrap_angle(m - 3.1), 0.0, 1e-9);    // 中值贴 3.1 侧
+}
+
+TEST(MedianWindow, ResetClearsWindowState)
+{
+    // reset_all 经 unique_ptr 虚调用真清到实例 (MRS 按值拷贝坑对治);
+    // 参考系事件后旧坐标系历史不再污染中值
+    BiasEstimator host{BiasEstimatorParams{}};
+    ObsIntake intake;
+    intake.add(std::unique_ptr<ObsProcessor>(new MedianWindow(3)));
+
+    for (int i = 0; i < 3; ++i) {
+        GlobalPoseObservation o = make_obs(5.0);    // 旧坐标系观测
+        intake.run(o, host);
+    }
+    intake.reset_all();
+    GlobalPoseObservation fresh = make_obs(1.0);    // 新坐标系首帧
+    EXPECT_TRUE(intake.run(fresh, host));
+    EXPECT_NEAR(fresh.T_obs.x, 1.0, 1e-12);         // 不被旧值 5.0 拖住
+}
+
+TEST(MedianWindow, WindowOnePassesThrough)
+{
+    BiasEstimator host{BiasEstimatorParams{}};
+    ObsIntake intake;
+    intake.add(std::unique_ptr<ObsProcessor>(new MedianWindow(1)));
+    GlobalPoseObservation o = make_obs(0.37);
+    EXPECT_TRUE(intake.run(o, host));
+    EXPECT_NEAR(o.T_obs.x, 0.37, 1e-12);    // 逐位直通 (默认关闭零差异)
+}
+
+TEST(TagCountQuality, TiersByTagCount)
+{
+    BiasEstimator host{BiasEstimatorParams{}};
+    ObsIntake intake;
+    intake.add(std::unique_ptr<ObsProcessor>(new TagCountQuality(0.4, 0.7)));
+
+    auto quality_for = [&](int tags) {
+        GlobalPoseObservation o = make_obs();
+        o.tag_count = tags;
+        EXPECT_TRUE(intake.run(o, host));
+        return o.quality;
+    };
+    EXPECT_NEAR(quality_for(-1), 1.0, 1e-12);    // 未提供 → 直通满质量
+    EXPECT_NEAR(quality_for(5), 1.0, 1e-12);
+    EXPECT_NEAR(quality_for(3), 1.0, 1e-12);
+    EXPECT_NEAR(quality_for(2), 0.7, 1e-12);
+    EXPECT_NEAR(quality_for(1), 0.4, 1e-12);
+    EXPECT_NEAR(quality_for(0), 0.4, 1e-12);     // 0-tag 有 pose = 上游异常,
+                                                  // 并入最低档保守处理
+}
+
+TEST(TagCountQuality, ComposesMultiplicativelyWithUpstream)
+{
+    // quality 乘法复合: 上游 processor 已降到 0.5, 单 tag 档 0.4 → 0.2
+    BiasEstimator host{BiasEstimatorParams{}};
+    ObsIntake intake;
+    intake.add(std::unique_ptr<ObsProcessor>(
+        new Probe(ProcResult{false, true}, 0.5)));
+    intake.add(std::unique_ptr<ObsProcessor>(new TagCountQuality(0.4, 0.7)));
+
+    GlobalPoseObservation o = make_obs();
+    o.tag_count = 1;
+    EXPECT_TRUE(intake.run(o, host));
+    EXPECT_NEAR(o.quality, 0.2, 1e-12);
+}
+
+TEST(TagCountQuality, CtorValidatesTiers)
+{
+    // 加载期硬断言: 0 < single ≤ dual ≤ 1 (fail-fast 哲学同三带 Δ≤L)
+    EXPECT_THROW(TagCountQuality(0.7, 0.4), std::invalid_argument);
+    EXPECT_THROW(TagCountQuality(0.0, 0.7), std::invalid_argument);
+    EXPECT_THROW(TagCountQuality(0.4, 1.5), std::invalid_argument);
+    EXPECT_NO_THROW(TagCountQuality(0.4, 0.7));
+    EXPECT_NO_THROW(TagCountQuality(1.0, 1.0));
 }

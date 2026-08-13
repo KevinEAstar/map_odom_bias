@@ -112,8 +112,8 @@ MapOdomBiasNode::MapOdomBiasNode()
         this->declare_parameter<double>("cmd_max_correction_rate_yaw", 0.5);
     bp.observation_timeout =
         this->declare_parameter<double>("observation_timeout", 2.0);
-    bp.raw_median_window =
-        this->declare_parameter<int>("raw_median_window", 1);
+    // v2 质量链: 中值窗迁至 intake 链 (原 raw_median_window, 门控后→门控前)
+    int median_window = this->declare_parameter<int>("median_window", 1);
     double tf_publish_rate =
         this->declare_parameter<double>("tf_publish_rate", 50.0);
 
@@ -144,12 +144,17 @@ MapOdomBiasNode::MapOdomBiasNode()
     sanitize("tf_publish_rate", tf_publish_rate, true, 50.0);
     bp.init_confirm_frames = std::max(1, bp.init_confirm_frames);
     bp.gate_confirm_frames = std::max(1, bp.gate_confirm_frames);
-    bp.raw_median_window = std::max(1, bp.raw_median_window);
+    median_window = std::max(1, median_window);
 
     odom_buffer_.reset(new OdomBuffer(odom_buffer_duration, max_extrapolation));
     estimator_.reset(new BiasEstimator(bp));
-    // 修正源两票链 (五节 5.2, C1: 接口 v1 就位): v1 首发 = FiniteGuard
+    // 修正源两票链 (五节 5.2): FiniteGuard 首位; v2 质量链按配置追加
+    // (中值前置于钳位类的链序约束)
     intake_.add(std::unique_ptr<ObsProcessor>(new FiniteGuard));
+    if (median_window > 1) {
+        intake_.add(std::unique_ptr<ObsProcessor>(
+            new MedianWindow(median_window)));
+    }
 
     // [✅] Step 2: 订阅
     // map 系机体位姿观测 (定位节点输出, header.stamp = 图像曝光时刻)
