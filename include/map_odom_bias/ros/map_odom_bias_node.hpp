@@ -30,6 +30,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <std_msgs/msg/int32.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 
 #include <map_odom_bias/msg/bias_status.hpp>
@@ -87,13 +88,19 @@ private:
     std::unique_ptr<OdomBuffer> odom_buffer_;
     std::unique_ptr<BiasEstimator> estimator_;
     std::unique_ptr<Px4ResetSource> reset_source_;
-    ObsIntake intake_;    // 修正源两票链 (v1 = FiniteGuard)
+    ObsIntake intake_;    // 修正源两票链 (FiniteGuard + v2 质量链按配置)
 
     uint32_t eval_fallback_count_{0};    // tick 时缓冲空的退化计数 (健康信号)
+
+    // ---- v2 质量链: tag 数旁路缓存 (TagCountQuality 的上游信号) ----
+    int last_tag_count_{-1};             // 最近一帧 tag 数; -1 = 未收到
+    HostTime last_tag_count_arrival_;    // 到达刻 (配对时效判定, ⑤口径)
+    double tag_count_max_age_{0.2};      // s, 超龄不配对 (回落 -1 满质量)
 
     // ---- ROS 接口 ----
     rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
+    rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr tag_count_sub_;
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr ctrl_pub_;
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr cmd_pub_;
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr raw_pub_;

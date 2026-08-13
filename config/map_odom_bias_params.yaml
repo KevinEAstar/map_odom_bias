@@ -38,5 +38,19 @@
     # 无有效观测超时进 STALE s (断流仅影响健康信号, 阈值宽松);
     # "有效" = 被账本采纳的观测, 误检风暴下账本停更同样进 STALE
     observation_timeout: 2.0
-    # raw 中值去毛刺窗口 (帧), 1 = 关闭 (默认不滤保持"监控要真")
-    median_window: 1        # v2: 中值窗迁 intake 链 (门控前), 1=关
+    # 观测中值去毛刺窗口 (帧), intake 链上门控前 (v2 自估计器迁入), 1 = 关闭
+    median_window: 1
+
+    # ---- v2 质量链: 三带门限 + 软降权 (设计文档 v1 4.4/5.3) ----
+    # 正常吸收带上界 Δ (m / rad); -1 = 跟随 gate_* 阈值 = 降权带宽零 = 关闭。
+    # 启用时须 Δ ≤ L (gate_*), 违反在加载期 fail-fast
+    gate_soft_trans_threshold: -1.0
+    gate_soft_yaw_threshold: -1.0
+    # 降权带 (Δ<err≤L) 帧的质量因子; α·q 等价该帧 τ 拉长 1/q 倍
+    band_quality: 0.3333
+    # tag 数分档源 (std_msgs/Int32); 空 = 不订阅不装配 (质量链源侧关闭)。
+    # 实机/仿真接线: relay 侧并发本帧解算 tag 数即可
+    tag_count_topic: ""
+    tag_quality_single: 0.4    # ≤1 tag 档 (单 tag = PnP 双解翻转风险)
+    tag_quality_dual: 0.7      # 2 tag 档; ≥3 满质量 1.0
+    tag_count_max_age: 0.2     # s, tag 数与 pose 的配对时效窗 (到达刻口径)

@@ -29,3 +29,6 @@ float64 last_jump_yaw              # 最近一次确认跳变的 yaw 幅度 rad
 uint32 reset_event_count           # EKF reset 补偿事件累计; 频发 = EKF2 内部估计不稳
 float64 last_reset_trans           # 最近一次 reset 的 delta 平移范数 m
 float64 last_reset_yaw             # 最近一次 reset 的 delta yaw 幅度 rad
+float64 obs_quality                # v2 质量链: 最后采纳观测的有效质量
+                                   # q_eff = 源质量(tag 分档等)×带质量(三带);
+                                   # ctrl/cmd 吸收增益按 α·q_eff 软降权

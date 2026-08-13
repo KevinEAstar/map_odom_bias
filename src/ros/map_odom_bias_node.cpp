@@ -114,6 +114,23 @@ MapOdomBiasNode::MapOdomBiasNode()
         this->declare_parameter<double>("observation_timeout", 2.0);
     // v2 质量链: 中值窗迁至 intake 链 (原 raw_median_window, 门控后→门控前)
     int median_window = this->declare_parameter<int>("median_window", 1);
+    // v2 三带门限 (Δ 哨兵 -1 = 跟随 gate = 降权带宽零 = 旧行为; Δ>L 由
+    // 估计器构造硬断言 fail-fast) 与降权带质量因子
+    bp.gate_soft_trans_threshold =
+        this->declare_parameter<double>("gate_soft_trans_threshold", -1.0);
+    bp.gate_soft_yaw_threshold =
+        this->declare_parameter<double>("gate_soft_yaw_threshold", -1.0);
+    bp.band_quality =
+        this->declare_parameter<double>("band_quality", 1.0 / 3.0);
+    // v2 tag 数分档 (tag_count_topic 空 = 不订不装配, 质量链源侧关闭)
+    const std::string tag_count_topic =
+        this->declare_parameter<std::string>("tag_count_topic", "");
+    const double tag_quality_single =
+        this->declare_parameter<double>("tag_quality_single", 0.4);
+    const double tag_quality_dual =
+        this->declare_parameter<double>("tag_quality_dual", 0.7);
+    tag_count_max_age_ =
+        this->declare_parameter<double>("tag_count_max_age", 0.2);
     double tf_publish_rate =
         this->declare_parameter<double>("tf_publish_rate", 50.0);
 
@@ -154,6 +171,20 @@ MapOdomBiasNode::MapOdomBiasNode()
     if (median_window > 1) {
         intake_.add(std::unique_ptr<ObsProcessor>(
             new MedianWindow(median_window)));
+    }
+    if (!tag_count_topic.empty()) {
+        // 分档非法在此 fail-fast (加载期硬断言, 同三带 Δ≤L 哲学)
+        intake_.add(std::unique_ptr<ObsProcessor>(
+            new TagCountQuality(tag_quality_single, tag_quality_dual)));
+        tag_count_sub_ = this->create_subscription<std_msgs::msg::Int32>(
+            tag_count_topic, rclcpp::SensorDataQoS(),
+            [this](std_msgs::msg::Int32::SharedPtr m) {
+                last_tag_count_ = m->data;
+                last_tag_count_arrival_ = HostTime{this->now().seconds()};
+            });
+        RCLCPP_INFO(this->get_logger(),
+            "🏷 [BIAS] tag 数分档启用: topic=%s 档位 single=%.2f dual=%.2f",
+            tag_count_topic.c_str(), tag_quality_single, tag_quality_dual);
     }
 
     // [✅] Step 2: 订阅
@@ -251,6 +282,11 @@ void MapOdomBiasNode::pose_callback(
     gobs.t_arrival = HostTime{this->now().seconds()};
     gobs.T_obs = pm::bias_observation(pose_from_msg(msg->pose.pose), odom_base);
     gobs.p_ob = odom_base.p;
+    // v2: tag 数旁路配对 (到达刻时效窗内才采信, 超龄回落 -1 = 满质量)
+    if (last_tag_count_ >= 0 &&
+        age_of(last_tag_count_arrival_, gobs.t_arrival) <= tag_count_max_age_) {
+        gobs.tag_count = last_tag_count_;
+    }
     if (!intake_.run(gobs, *estimator_)) {
         return;    // 生死票废弃 (计数进 status.intake_dropped)
     }
@@ -258,7 +294,7 @@ void MapOdomBiasNode::pose_callback(
     const uint32_t jumps_before = estimator_->jump_count();
     const pm::Transform4D raw_before = estimator_->raw();
     estimator_->add_observation(gobs.T_obs, gobs.t_sample, gobs.t_arrival,
-                                gobs.p_ob);
+                                gobs.p_ob, gobs.quality);
     handle_state_change(prev);
     if (estimator_->jump_count() != jumps_before) {
         RCLCPP_WARN(this->get_logger(),
@@ -269,6 +305,7 @@ void MapOdomBiasNode::pose_callback(
             map_odom_bias::msg::ResetEvent::CAUSE_SOURCE_JUMP,
             pm::compose(estimator_->raw(), pm::inverse(raw_before)),
             this->now());
+        intake_.reset_all();    // 链上历史 (中值窗) 属旧基准, 一并清空
         publish_status(this->now());
     }
 
@@ -409,6 +446,7 @@ void MapOdomBiasNode::publish_status(const rclcpp::Time & stamp)
         ? age_of(estimator_->last_obs_arrival(), HostTime{stamp.seconds()})
         : -1.0;
     msg.obs_delay = estimator_->last_obs_delay();
+    msg.obs_quality = estimator_->last_obs_quality();
     msg.iteration = estimator_->reference_iteration();
     msg.gate_reject_count = estimator_->gate_reject_count();
     msg.intake_dropped = intake_.dropped_count();
