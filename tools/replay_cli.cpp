@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "map_odom_bias/core/bias_estimator.hpp"
+#include "map_odom_bias/core/obs_intake.hpp"
 #include "map_odom_bias/core/odom_buffer.hpp"
 #include "map_odom_bias/core/pose_math.hpp"
 #include "map_odom_bias/core/time_types.hpp"
@@ -119,12 +120,35 @@ int main(int argc, char ** argv)
 {
     if (argc < 4) {
         std::fprintf(stderr,
-            "用法: replay_cli <inputs_dir> <out_dir> --metric=param|body\n");
+            "用法: replay_cli <inputs_dir> <out_dir> --metric=param|body "
+            "[--soft-trans=X --soft-yaw=Y --band=Q --median=N]\n");
         return 1;
     }
     const std::string in_dir = argv[1];
     const std::string out_dir = argv[2];
     const bool body_metric = std::strcmp(argv[3], "--metric=body") == 0;
+
+    // ---- v2 质量链开关 (离线开带对照; 缺省全关 = v1 行为逐位保持) ----
+    //   --soft-trans=Δ --soft-yaw=Δψ : 三带正常带上界 (缺省跟随 gate)
+    //   --band=q                     : 降权带质量因子 (缺省 1/3)
+    //   --median=N                   : 观测中值窗 (缺省 1 = 关)
+    double soft_trans = -1.0, soft_yaw = -1.0, band_q = 1.0 / 3.0;
+    int median_window = 1;
+    for (int i = 4; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a.rfind("--soft-trans=", 0) == 0) {
+            soft_trans = std::atof(a.c_str() + 13);
+        } else if (a.rfind("--soft-yaw=", 0) == 0) {
+            soft_yaw = std::atof(a.c_str() + 11);
+        } else if (a.rfind("--band=", 0) == 0) {
+            band_q = std::atof(a.c_str() + 7);
+        } else if (a.rfind("--median=", 0) == 0) {
+            median_window = std::atoi(a.c_str() + 9);
+        } else {
+            std::fprintf(stderr, "未知参数: %s\n", a.c_str());
+            return 1;
+        }
+    }
 
     // ---- 装载三路输入 (obs_tf.csv 存在时优先: 现成观测变换模式) ----
     std::vector<ObsRow> obs;
@@ -166,9 +190,20 @@ int main(int argc, char ** argv)
                  obs.size(), odom.size(), resets.size(),
                  body_metric ? "body" : "param");
 
-    // ---- 核心件 (参数 = 代码默认 = 08-06 板端配置) ----
+    // ---- 核心件 (参数 = 代码默认 = 08-06 板端配置 + 质量链开关) ----
     OdomBuffer buffer(4.0, 0.05);
-    BiasEstimator est(BiasEstimatorParams{});
+    BiasEstimatorParams bp;
+    bp.gate_soft_trans_threshold = soft_trans;
+    bp.gate_soft_yaw_threshold = soft_yaw;
+    bp.band_quality = band_q;
+    BiasEstimator est(bp);
+    // 中值窗与在线同件同位 (intake 链, 门控前); SOURCE_JUMP/reset 后
+    // 洗窗对齐节点行为 (jump_count 变化检测 / apply_reset 分支)
+    map_odom_bias::MedianWindow median(median_window);
+    std::fprintf(stderr,
+                 "质量链: soft=%.3f/%.3f band=%.3f median=%d\n",
+                 bp.gate_soft_trans_threshold, bp.gate_soft_yaw_threshold,
+                 bp.band_quality, median_window);
     static constexpr double kTickDt = 0.02;             // 50 Hz
     static constexpr double kSettleDuration = 0.05;     // reset 静默窗
 
@@ -176,7 +211,7 @@ int main(int argc, char ** argv)
     f_obs << std::setprecision(15);    // 绝对时间秒 (1.8e9) 需 15 位有效数字
     f_obs << "t_bag,t_hdr,query_ok,state,gate_reject,jump_count,"
              "raw_x,raw_y,raw_z,raw_yaw,err_param_trans,err_body_trans,"
-             "err_yaw,p_ob_norm\n";
+             "err_yaw,p_ob_norm,q_eff\n";
     std::ofstream f_tick(out_dir + "/tick_ledger.csv");
     f_tick << std::setprecision(15);
     f_tick << "t,state,ctrl_x,ctrl_y,ctrl_z,ctrl_yaw,"
@@ -240,9 +275,19 @@ int main(int argc, char ** argv)
             if (ok) {
                 // tf 模式: 观测变换现成 (p_ob 仍需配对提供评估点);
                 // pose 模式: 由位姿对构造 4DoF 偏差观测
-                const pm::Transform4D t_obs = row.is_tf
+                pm::Transform4D t_obs = row.is_tf
                     ? row.tf
                     : pm::bias_observation(row.pose, odom_base);
+                // 中值窗 (在线同件同位: 门控前观测流)
+                if (median_window > 1) {
+                    map_odom_bias::GlobalPoseObservation g;
+                    g.t_sample = SampleTime{row.t_hdr};
+                    g.t_arrival = HostTime{row.t_bag};
+                    g.T_obs = t_obs;
+                    g.p_ob = odom_base.p;
+                    median.process(g, est);
+                    t_obs = g.T_obs;
+                }
                 // 双度量 err 只为分析记录 (门控行为由模式决定)
                 const pm::Transform4D & raw = est.raw();
                 const pm::TransformError e_param = pm::transform_error(
@@ -250,12 +295,16 @@ int main(int argc, char ** argv)
                 const pm::TransformError e_body = pm::transform_error(
                     t_obs, raw, std::vector<std::array<double, 3>>{odom_base.p});
                 // 采样刻 = header 戳, 到达刻 = bag 写入戳 (回放保真)
+                const uint32_t jumps_before = est.jump_count();
                 if (body_metric) {
                     est.add_observation(t_obs, SampleTime{row.t_hdr},
                                         HostTime{row.t_bag}, odom_base.p);
                 } else {
                     est.add_observation(t_obs, SampleTime{row.t_hdr},
                                         HostTime{row.t_bag});
+                }
+                if (est.jump_count() != jumps_before) {
+                    median.reset();    // SOURCE_JUMP 后洗窗 (对齐节点 reset_all)
                 }
                 f_obs << row.t_bag << ',' << row.t_hdr << ",1,"
                       << static_cast<int>(est.state()) << ','
@@ -265,12 +314,13 @@ int main(int argc, char ** argv)
                       << e_param.trans << ',' << e_body.trans << ','
                       << e_param.yaw << ','
                       << norm3d(odom_base.p[0], odom_base.p[1], odom_base.p[2])
+                      << ',' << est.last_obs_quality()
                       << '\n';
             } else {
                 f_obs << row.t_bag << ',' << row.t_hdr << ",0,"
                       << static_cast<int>(est.state()) << ','
                       << est.gate_reject_count() << ',' << est.jump_count()
-                      << ",,,,,,,,\n";
+                      << ",,,,,,,,,\n";
             }
             ++ib;
         } else {
@@ -292,6 +342,7 @@ int main(int argc, char ** argv)
                     pm::make_heading_reset_delta(dpsi, p_ob), d_total);
             }
             est.apply_reset(d_total);
+            median.reset();    // 窗内历史属旧坐标系 (对齐节点 reset_all)
             buffer.clear_and_settle(
                 SampleTime{r.t_bag + kSettleDuration});
             ++ir;
