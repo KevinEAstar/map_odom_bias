@@ -68,11 +68,23 @@ struct BiasEstimatorParams
                                             // (默认不滤保持"监控要真")
     double max_tick_dt{0.2};                // s, 单拍步进 dt 防御上限 (定时器
                                             // 挂起恢复时防单步大跳, 实现防御项)
+    // ---- v2 质量链: 三带门限 + 软降权 (设计文档 v1 4.4/5.3) ----
+    double gate_soft_trans_threshold{-1.0}; // m, 正常吸收带上界 Δ; <0 =
+                                            // 跟随 gate_trans_threshold
+                                            // (降权带宽零 = 三带退化两带)
+    double gate_soft_yaw_threshold{-1.0};   // rad, yaw 同义
+    double band_quality{1.0 / 3.0};         // 降权带 (Δ<err≤L) 帧的质量因子;
+                                            // MRS R×c≈τ×√c 直觉: 1/3 ≈ τ×3
 };
 
 class BiasEstimator
 {
 public:
+    /**
+     * @throw std::invalid_argument 质量链参数非法时 (Δ>L 或 band_quality
+     *        出 (0,1]) —— 加载期硬断言, MRS rtk 配置把钳位层静默架空
+     *        (limit==max) 的反例对治: 配置错误 fail-fast 不带病运行
+     */
     explicit BiasEstimator(const BiasEstimatorParams & params);
 
     /**
@@ -86,6 +98,13 @@ public:
      *             位置) —— 门控在该点做机体点残差度量 (③修法, 设计文档 v1
      *             四节): yaw 解算噪声经力臂 |p_ob| 的平移伪差在此度量下
      *             恒零, 真平移误差如实计量。默认原点 = 参数空间旧度量。
+     * @param quality 上游源质量 [0,1] (obs_intake 链 TagQuality 类 processor
+     *             产出, 缺省满质量)。三带门控 (设计 4.4): err≤Δ 正常带
+     *             q_band=1 / Δ<err≤L 降权带 q_band=band_quality / err>L
+     *             拒绝带走候选队列。采纳帧记 q_eff = quality·q_band,
+     *             消费在 tick 吸收 α←α·q_eff (5.3 软降权); **raw 账本
+     *             始终采纳原值不降权 —— 打标消费分离, 账本纯净性保住
+     *             判卷工具链**。
      *
      * 状态机行为:
      *   UNINITIALIZED → 进入 INITIALIZING (obs 为首个初始化候选)
@@ -98,7 +117,8 @@ public:
      */
     void add_observation(const pose_math::Transform4D & obs,
                          SampleTime t_sample, HostTime t_arrival,
-                         const std::array<double, 3> & p_ob = {{0.0, 0.0, 0.0}});
+                         const std::array<double, 3> & p_ob = {{0.0, 0.0, 0.0}},
+                         double quality = 1.0);
 
     /**
      * @brief 定时步进 (tf_publish_rate 驱动): STALE 判定 + ctrl/cmd 双通道吸收
@@ -162,6 +182,9 @@ public:
     /// 最后被采纳观测的端到端延迟 (到达 − 采样, 同源钟假设;
     /// status.obs_delay 数据源 —— EV_DELAY 类旋钮不再离线反推)
     double last_obs_delay() const { return last_obs_delay_; }
+    /// 最后被采纳观测的有效质量 q_eff = 源质量 × 带质量 (v2 软降权;
+    /// 1.0 = 满质量满速吸收, 被拒绝的观测不刷新)
+    double last_obs_quality() const { return current_quality_; }
     bool has_observation() const { return has_observation_; }
     /// 门控拒绝累计: 候选队列被抛弃时按帧数计入 (被正常路径清空 / 与新帧
     /// 不一致被重置); 最终确认为真实跳变的候选帧不计 —— 合法重定位事件
@@ -198,7 +221,7 @@ private:
 
     void gate_and_update(const pose_math::Transform4D & obs,
                          SampleTime t_sample, HostTime t_arrival,
-                         const std::array<double, 3> & p_ob);
+                         const std::array<double, 3> & p_ob, double quality);
     /// 观测被账本采纳时的时序记账 (采样刻 + 到达刻 + 延迟)
     void note_observation(SampleTime t_sample, HostTime t_arrival);
     /// 正常路径采纳: raw_median_window > 1 时经中值窗口去毛刺
@@ -211,12 +234,15 @@ private:
     BiasEstimatorParams params_;
     BiasState state_{BiasState::UNINITIALIZED};
 
-    /// 单通道吸收步进 (ctrl/cmd 共用律): state += clamp(delta·dt/τ),
-    /// 平移预算在 eval_points 上以机体点位移度量
+    /// 单通道吸收步进 (ctrl/cmd 共用律): state += clamp(delta·(dt/τ)·q),
+    /// 平移预算在 eval_points 上以机体点位移度量。quality = 软降权因子
+    /// (5.3): 降权是线性缩放保留幅值信息 (零均值毛刺自抵消), 钳位是硬
+    /// 非线性在饱和区丢幅值留符号 —— 降权在前、钳位退化为最后兜底
     static void absorb_toward(const pose_math::Transform4D & target,
                               pose_math::Transform4D & state, double dt,
                               double tau, double rate_trans, double rate_yaw,
-                              const std::vector<std::array<double, 3>> & eval_points);
+                              const std::vector<std::array<double, 3>> & eval_points,
+                              double quality);
 
     pose_math::Transform4D raw_;
     pose_math::Transform4D ctrl_;
@@ -229,6 +255,7 @@ private:
     SampleTime last_obs_sample_;
     HostTime last_obs_arrival_;
     double last_obs_delay_{0.0};
+    double current_quality_{1.0};    // 最后采纳帧 q_eff (软降权消费源)
     bool has_observation_{false};
     HostTime last_tick_;
     bool has_ticked_{false};

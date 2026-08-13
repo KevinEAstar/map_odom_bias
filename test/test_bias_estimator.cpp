@@ -931,3 +931,147 @@ TEST_F(BiasEstimatorTest, DivergenceAtBodyPoint)
     EXPECT_NEAR(e.divergence_yaw(), 0.1, 1e-12);
     EXPECT_NEAR(e.divergence_cmd_trans(eval), 0.0, 1e-12);    // cmd==ctrl
 }
+
+// ================= v2 质量链: 三带门限 + 软降权 (设计 4.4/5.3) =================
+
+TEST_F(BiasEstimatorTest, SoftBandAcceptsWithDegradedQuality)
+{
+    // 降权带 (Δ < err ≤ L): 采纳原值进账本 (raw 打标不降权),
+    // ctrl/cmd 吸收增益 α ← α·band_quality (软降权消费)
+    params_.gate_soft_trans_threshold = 0.1;
+    params_.band_quality = 0.5;
+    BiasEstimator e(params_);
+    init_to(e, t4(0.0, 0.0, 0.0, 0.0));
+    run_ticks(e, 1);    // 建 tick 基准
+
+    feed(e, t4(0.2, 0.0, 0.0, 0.0), 1);    // err=0.2 ∈ (0.1, 0.3] 降权带
+    expect_t4_near(e.raw(), t4(0.2, 0.0, 0.0, 0.0), 1e-12);    // 账本要真
+    EXPECT_NEAR(e.last_obs_quality(), 0.5, 1e-12);
+
+    run_ticks(e, 1);
+    // 步进 = delta·(dt/τ)·q; 本拍 dt = kObsDt+kTickDt (feed 推进了时间轴)
+    EXPECT_NEAR(e.ctrl().x, 0.2 * ((kObsDt + kTickDt) / 5.0) * 0.5, 1e-12);
+}
+
+TEST_F(BiasEstimatorTest, NormalBandKeepsFullQuality)
+{
+    params_.gate_soft_trans_threshold = 0.1;
+    params_.band_quality = 0.5;
+    BiasEstimator e(params_);
+    init_to(e, t4(0.0, 0.0, 0.0, 0.0));
+    run_ticks(e, 1);
+
+    feed(e, t4(0.05, 0.0, 0.0, 0.0), 1);    // err=0.05 ≤ Δ 正常带
+    EXPECT_NEAR(e.last_obs_quality(), 1.0, 1e-12);
+    run_ticks(e, 1);
+    EXPECT_NEAR(e.ctrl().x, 0.05 * ((kObsDt + kTickDt) / 5.0), 1e-12);    // 满速吸收
+}
+
+TEST_F(BiasEstimatorTest, RejectBandBehaviorUnchanged)
+{
+    // 拒绝带 (err > L): 候选队列路径不变 —— 超门野值原样计入候选,
+    // 不钳边界 (MRS "大异常必须透传" 原则), quality 不刷新
+    params_.gate_soft_trans_threshold = 0.1;
+    BiasEstimator e(params_);
+    init_to(e, t4(0.0, 0.0, 0.0, 0.0));
+
+    feed(e, t4(0.5, 0.0, 0.0, 0.0), 1);    // err=0.5 > 0.3 拒绝带
+    expect_t4_near(e.raw(), t4(0.0, 0.0, 0.0, 0.0), 1e-12);    // 账本不动
+    EXPECT_NEAR(e.last_obs_quality(), 1.0, 1e-12);             // 未刷新
+}
+
+TEST_F(BiasEstimatorTest, SourceQualityScalesAbsorption)
+{
+    // 上游 quality (TagQuality 类 processor 产出) 经 add_observation 进入,
+    // 正常带帧 α ← α·q_src
+    BiasEstimator e(params_);
+    init_to(e, t4(0.0, 0.0, 0.0, 0.0));
+    run_ticks(e, 1);
+
+    t_ += kObsDt;
+    e.add_observation(t4(0.2, 0.0, 0.0, 0.0), SampleTime{t_}, HostTime{t_},
+                      {{0.0, 0.0, 0.0}}, 0.5);
+    expect_t4_near(e.raw(), t4(0.2, 0.0, 0.0, 0.0), 1e-12);
+    EXPECT_NEAR(e.last_obs_quality(), 0.5, 1e-12);
+
+    run_ticks(e, 1);
+    EXPECT_NEAR(e.ctrl().x, 0.2 * ((kObsDt + kTickDt) / 5.0) * 0.5, 1e-12);
+    // cmd 快通道同样降权
+    EXPECT_NEAR(e.cmd().x, 0.2 * ((kObsDt + kTickDt) / 0.5) * 0.5, 1e-12);
+}
+
+TEST_F(BiasEstimatorTest, QualityComposesBandTimesSource)
+{
+    // 复合: q_eff = q_src × q_band
+    params_.gate_soft_trans_threshold = 0.1;
+    params_.band_quality = 0.5;
+    BiasEstimator e(params_);
+    init_to(e, t4(0.0, 0.0, 0.0, 0.0));
+
+    t_ += kObsDt;
+    e.add_observation(t4(0.2, 0.0, 0.0, 0.0), SampleTime{t_}, HostTime{t_},
+                      {{0.0, 0.0, 0.0}}, 0.4);    // 降权带 × 源 0.4
+    EXPECT_NEAR(e.last_obs_quality(), 0.2, 1e-12);
+}
+
+TEST_F(BiasEstimatorTest, DefaultSoftThresholdFollowsGate)
+{
+    // 默认参数 (soft 哨兵 -1 → 跟随 gate): 降权带宽为零, 门限内全部
+    // 满质量 —— v1 行为精确退化 (兼容回归的机制面)
+    BiasEstimator e(params_);
+    init_to(e, t4(0.0, 0.0, 0.0, 0.0));
+    feed(e, t4(0.29, 0.0, 0.0, 0.0), 1);    // 贴 L 仍是正常带
+    EXPECT_NEAR(e.last_obs_quality(), 1.0, 1e-12);
+    expect_t4_near(e.raw(), t4(0.29, 0.0, 0.0, 0.0), 1e-12);
+}
+
+TEST_F(BiasEstimatorTest, ConstructorValidatesQualityChainParams)
+{
+    // Δ ≤ L 加载期硬断言 (MRS rtk 配置钳位层被静默架空的反例对治);
+    // band_quality ∈ (0,1]
+    BiasEstimatorParams bad = params_;
+    bad.gate_soft_trans_threshold = 0.4;    // > gate 0.3
+    EXPECT_THROW(BiasEstimator{bad}, std::invalid_argument);
+
+    bad = params_;
+    bad.gate_soft_yaw_threshold = 0.3;      // > gate_yaw 0.17
+    EXPECT_THROW(BiasEstimator{bad}, std::invalid_argument);
+
+    bad = params_;
+    bad.band_quality = 0.0;
+    EXPECT_THROW(BiasEstimator{bad}, std::invalid_argument);
+    bad.band_quality = 1.5;
+    EXPECT_THROW(BiasEstimator{bad}, std::invalid_argument);
+
+    BiasEstimatorParams ok = params_;
+    ok.gate_soft_trans_threshold = 0.1;     // 合法降权带
+    ok.gate_soft_yaw_threshold = 0.05;
+    EXPECT_NO_THROW(BiasEstimator{ok});
+}
+
+TEST_F(BiasEstimatorTest, JumpConfirmRecordsSourceQualityWithoutBand)
+{
+    // 跳变确认是拒绝带的出口 (合法重定位), 不属于降权带 —— 只记源质量
+    BiasEstimator e(params_);
+    init_to(e, t4(0.0, 0.0, 0.0, 0.0));
+    for (int i = 0; i < params_.gate_confirm_frames; ++i) {
+        t_ += kObsDt;
+        e.add_observation(t4(1.0, 0.0, 0.0, 0.0), SampleTime{t_}, HostTime{t_},
+                          {{0.0, 0.0, 0.0}}, 0.6);
+    }
+    EXPECT_EQ(e.jump_count(), 1u);
+    EXPECT_NEAR(e.last_obs_quality(), 0.6, 1e-12);
+}
+
+TEST_F(BiasEstimatorTest, NonFiniteQualityRejectedAtEntry)
+{
+    // 入口有限性守卫覆盖 quality (纵深防御, 与 FiniteGuard 同口径)
+    BiasEstimator e(params_);
+    init_to(e, t4(0.0, 0.0, 0.0, 0.0));
+    t_ += kObsDt;
+    e.add_observation(t4(0.1, 0.0, 0.0, 0.0), SampleTime{t_}, HostTime{t_},
+                      {{0.0, 0.0, 0.0}},
+                      std::numeric_limits<double>::quiet_NaN());
+    EXPECT_EQ(e.invalid_obs_count(), 1u);
+    expect_t4_near(e.raw(), t4(0.0, 0.0, 0.0, 0.0), 1e-12);    // 未入账本
+}

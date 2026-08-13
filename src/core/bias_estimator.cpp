@@ -7,15 +7,42 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 namespace map_odom_bias
 {
 
 namespace pm = pose_math;
 
+namespace
+{
+double clamp01(double q)
+{
+    return std::max(0.0, std::min(1.0, q));
+}
+}  // namespace
+
 BiasEstimator::BiasEstimator(const BiasEstimatorParams & params)
 : params_(params)
 {
+    // v2 质量链参数解析 (设计文档 v1 4.4): soft 哨兵 <0 → 跟随 gate
+    // (降权带宽零 = 旧行为); Δ≤L 加载期硬断言 —— MRS rtk 配置把
+    // limit==max 配成钳位层静默架空的反例对治, 配置错误 fail-fast
+    if (params_.gate_soft_trans_threshold < 0.0) {
+        params_.gate_soft_trans_threshold = params_.gate_trans_threshold;
+    }
+    if (params_.gate_soft_yaw_threshold < 0.0) {
+        params_.gate_soft_yaw_threshold = params_.gate_yaw_threshold;
+    }
+    if (params_.gate_soft_trans_threshold > params_.gate_trans_threshold ||
+        params_.gate_soft_yaw_threshold > params_.gate_yaw_threshold) {
+        throw std::invalid_argument(
+            "BiasEstimator: gate_soft_* 必须 ≤ gate_* (三带 Δ≤L)");
+    }
+    if (!(params_.band_quality > 0.0 && params_.band_quality <= 1.0)) {
+        throw std::invalid_argument(
+            "BiasEstimator: band_quality 必须 ∈ (0,1]");
+    }
 }
 
 bool BiasEstimator::within_at(const pm::Transform4D & a,
@@ -88,7 +115,8 @@ void BiasEstimator::note_observation(SampleTime t_sample, HostTime t_arrival)
 
 void BiasEstimator::add_observation(const pm::Transform4D & obs,
                                     SampleTime t_sample, HostTime t_arrival,
-                                    const std::array<double, 3> & p_ob)
+                                    const std::array<double, 3> & p_ob,
+                                    double quality)
 {
     // 有限性守卫: NaN/inf 观测一旦进账本, 门控比较对 NaN 恒 false 且
     // 速率 clamp 失效, raw/ctrl 无法恢复 —— 在唯一入口拦截
@@ -96,7 +124,7 @@ void BiasEstimator::add_observation(const pm::Transform4D & obs,
           std::isfinite(obs.z) && std::isfinite(obs.yaw) &&
           std::isfinite(t_sample.s) && std::isfinite(t_arrival.s) &&
           std::isfinite(p_ob[0]) && std::isfinite(p_ob[1]) &&
-          std::isfinite(p_ob[2]))) {
+          std::isfinite(p_ob[2]) && std::isfinite(quality))) {
         ++invalid_obs_count_;
         return;
     }
@@ -106,6 +134,7 @@ void BiasEstimator::add_observation(const pm::Transform4D & obs,
             init_candidates_.clear();
             init_candidates_.push_back(obs);
             note_observation(t_sample, t_arrival);
+            current_quality_ = clamp01(quality);
             state_ = BiasState::INITIALIZING;
             return;
 
@@ -114,6 +143,7 @@ void BiasEstimator::add_observation(const pm::Transform4D & obs,
             // 同口径 (门限之半), 防止用一帧误检完成初始化。
             // 候选可能被 reset 清空 (apply_reset), 此时 obs 成为新起点。
             note_observation(t_sample, t_arrival);    // 初始化候选均视为有效观测
+            current_quality_ = clamp01(quality);      // 记账 (初始化期无吸收消费)
             if (!init_candidates_.empty() &&
                 within_at(obs, init_candidates_.back(), p_ob,
                           params_.gate_trans_threshold * 0.5,
@@ -137,27 +167,39 @@ void BiasEstimator::add_observation(const pm::Transform4D & obs,
 
         case BiasState::TRACKING:
         case BiasState::STALE:
-            gate_and_update(obs, t_sample, t_arrival, p_ob);
+            gate_and_update(obs, t_sample, t_arrival, p_ob, quality);
             return;
     }
 }
 
 void BiasEstimator::gate_and_update(const pm::Transform4D & obs,
                                     SampleTime t_sample, HostTime t_arrival,
-                                    const std::array<double, 3> & p_ob)
+                                    const std::array<double, 3> & p_ob,
+                                    double quality)
 {
-    // 正常路径 (详设 4.4 第 1 条): 观测与 raw 的偏差在门限内 → 账本采纳。
-    // 度量在本帧机体点 p_ob 处评估 (③修法): "账本预测的机体 map 位置 vs
-    // 观测的机体 map 位置", yaw 噪声力臂贡献恒零。
+    // 三带门控 (详设 4.4 + v2 质量链): 度量在本帧机体点 p_ob 处评估
+    // (③修法): "账本预测的机体 map 位置 vs 观测的机体 map 位置",
+    // yaw 噪声力臂贡献恒零。
+    //   err ≤ Δ       正常吸收带: 采纳, q_band = 1
+    //   Δ < err ≤ L   降权带: 采纳但降档 (raw 仍进原值 —— 打标不降权,
+    //                 账本纯净; 降档消费在 tick 吸收 α·q)
+    //   err > L       拒绝带: 候选队列 N 帧确认跳变 (超门野值原样入队
+    //                 不钳边界 —— MRS "大异常必须透传" 原则)
     // last_obs_time 只在观测被账本采纳时刷新 —— 被拒绝的观测不算"有效",
     // 误检风暴下账本停更, obs_age 增长直至 STALE 告警 (详设 v2.1, F02)
-    if (within_at(obs, raw_, p_ob, params_.gate_trans_threshold,
+    const bool in_soft = within_at(obs, raw_, p_ob,
+                                   params_.gate_soft_trans_threshold,
+                                   params_.gate_soft_yaw_threshold);
+    if (in_soft ||
+        within_at(obs, raw_, p_ob, params_.gate_trans_threshold,
                   params_.gate_yaw_threshold)) {
         // 被正常路径清空的候选 = 被抛弃的观测, 按帧数计入拒绝 (F13)
         gate_reject_count_ += static_cast<uint32_t>(gate_candidates_.size());
         gate_candidates_.clear();
         accept_raw(obs);
         note_observation(t_sample, t_arrival);
+        current_quality_ =
+            clamp01(quality) * (in_soft ? 1.0 : params_.band_quality);
         if (state_ == BiasState::STALE) {
             state_ = BiasState::TRACKING;    // 观测被采纳 → 断流恢复
         }
@@ -182,6 +224,8 @@ void BiasEstimator::gate_and_update(const pm::Transform4D & obs,
             reseed_raw_window();
             record_jump(old_raw, raw_);
             note_observation(t_sample, t_arrival);
+            // 跳变确认是拒绝带的出口 (合法重定位), 不属于降权带 —— 只记源质量
+            current_quality_ = clamp01(quality);
             if (state_ == BiasState::STALE) {
                 state_ = BiasState::TRACKING;    // 候选确认 → 断流恢复
             }
@@ -233,10 +277,13 @@ void BiasEstimator::record_jump(const pm::Transform4D & old_raw,
 void BiasEstimator::absorb_toward(const pm::Transform4D & target,
                                   pm::Transform4D & state, double dt,
                                   double tau, double rate_trans, double rate_yaw,
-                                  const std::vector<std::array<double, 3>> & eval_points)
+                                  const std::vector<std::array<double, 3>> & eval_points,
+                                  double quality)
 {
-    // 吸收律 (详设 4.5, ctrl/cmd 共用): 一阶低通 + 速率硬上限
-    const double alpha = dt / tau;
+    // 吸收律 (详设 4.5, ctrl/cmd 共用): 一阶低通 + 速率硬上限。
+    // v2 软降权 (5.3): α ← α·q, 等价该帧 τ 临时拉长为 τ/q —— 降权在前
+    // (线性缩放保幅值信息), 下方速率钳位退化为最后兜底
+    const double alpha = dt / tau * quality;
     double step_x = (target.x - state.x) * alpha;
     double step_y = (target.y - state.y) * alpha;
     double step_z = (target.z - state.z) * alpha;
@@ -300,13 +347,16 @@ void BiasEstimator::tick(HostTime t_now,
         return;    // STALE 双通道冻结 / 未初始化无状态 / 无时间推进
     }
 
-    // ctrl 慢通道 (感知侧, 稳) 与 cmd 快通道 (指令侧, 贴 raw) 同律不同参
+    // ctrl 慢通道 (感知侧, 稳) 与 cmd 快通道 (指令侧, 贴 raw) 同律不同参;
+    // 双通道同吃软降权 q_eff (5.3: "ctrl/cmd 轨降权在前")
     absorb_toward(raw_, ctrl_, dt, params_.absorb_time_constant,
                   params_.max_correction_rate_trans,
-                  params_.max_correction_rate_yaw, eval_points);
+                  params_.max_correction_rate_yaw, eval_points,
+                  current_quality_);
     absorb_toward(raw_, cmd_, dt, params_.cmd_absorb_time_constant,
                   params_.cmd_max_correction_rate_trans,
-                  params_.cmd_max_correction_rate_yaw, eval_points);
+                  params_.cmd_max_correction_rate_yaw, eval_points,
+                  current_quality_);
 }
 
 void BiasEstimator::apply_reset(const pm::Transform4D & d)
