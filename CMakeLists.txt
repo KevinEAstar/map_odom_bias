@@ -101,6 +101,11 @@ if(BUILD_TESTING)
     test/test_bias_estimator.cpp
   )
   target_link_libraries(test_bias_estimator map_odom_bias_core)
+
+  ament_add_gtest(test_reference_tools
+    test/test_reference_tools.cpp
+  )
+  target_link_libraries(test_reference_tools map_odom_bias_core)
 endif()
 
 ament_package()

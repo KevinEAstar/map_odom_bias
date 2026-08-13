@@ -25,8 +25,18 @@ include/map_odom_bias/ros/    ROS 2 壳 (1 节点)
     px4_reset_source     PX4 EKF reset 接入层 (可替换 ResetSource 形态,
                          px4_msgs 依赖隔离于此; 非 PX4 系统替换本类)
 msg/BiasStatus.msg            健康信号 (状态机 / divergence / 各类计数)
-(规划中) tools/      消费者工具件 (header-only): Anchored/Rebasable / reset 握手
+include/map_odom_bias/tools/  消费者工具件 (header-only, 零 ROS 依赖)
+    reference_tools 参考系载体类型二分: Anchored (带帧, 只经变换取值,
+                    无叠加接口) / Rebasable (裸值, rebase(old,new) 端点
+                    差分 + 相邻 delta 快捷路径仅 Point) + RebaseBus
+                    (ResetEvent 统一分发, 幂等/跳号标记) + ResetTransaction
+                    (跳变窗口判据关一拍, 语义性恢复)
 ```
+
+工具件契约：消费侧持有的每个锚定量二选一——经变换出口取值的走
+`Anchored`（禁叠加，参考系事件由出口吸收），自持裸值的走 `Rebasable`
+（必须随 ResetEvent 补偿）；双重补偿在编译期写不出（static_assert 反例
+见 test_reference_tools.cpp）。cause 过滤在总线 handler 侧声明。
 
 度量口径（机体点残差）：门控在本帧观测配对的机体 odom 位置处评估残差，
 吸收钳位与 divergence 在 odom 缓冲最新样本位置处评估——yaw 解算噪声经
