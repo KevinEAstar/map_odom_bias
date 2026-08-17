@@ -113,7 +113,10 @@ MapOdomBiasNode::MapOdomBiasNode()
     bp.observation_timeout =
         this->declare_parameter<double>("observation_timeout", 2.0);
     // v2 质量链: 中值窗迁至 intake 链 (原 raw_median_window, 门控后→门控前)
-    int median_window = this->declare_parameter<int>("median_window", 1);
+    // 默认 3: 带真值观测病变判卷 (mob_pathology_0816) 中唯一双口径显著
+    // 正向件 — p95 回干净腿水平, ctrl/cmd gap −20~30%; 代价约一帧观测滞后。
+    // 设 1 = 关闭 (v1 行为)。
+    int median_window = this->declare_parameter<int>("median_window", 3);
     // v2 三带门限 (Δ 哨兵 -1 = 跟随 gate = 降权带宽零 = 旧行为; Δ>L 由
     // 估计器构造硬断言 fail-fast) 与降权带质量因子
     bp.gate_soft_trans_threshold =
